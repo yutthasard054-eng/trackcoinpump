@@ -92,7 +92,7 @@ async def main():
                             mint = data["mint"]
                             if sol >= MIN_BUY_SOL:
                                 WALLET_BUYS[wallet].append({"token": mint, "sol": sol})
-                                print(f"🛒 Tracking: {wallet[:8]}... | {sol} SOL | {mint[:8]}...")
+                                print(f"🛒 Tracking: {wallet} | {sol} SOL | {mint}")
                     except Exception as e:
                         print(f"⚠️ Message error: {e}")
         except Exception as e:
