@@ -14,13 +14,22 @@ MIN_ROI = 2.0
 CHECK_INTERVAL_SEC = 900  # 15 minutes
 
 # === STATE ===
-WALLET_BUYS = defaultdict(list)  # wallet -> [{"token": mint, "sol": sol}]
+WALLET_BUYS = defaultdict(list)
 ELITE_WALLETS = set()
 
-def save_elite():
+def save_and_log_elite():
+    # Save to file (for future trade executor)
     with open("/tmp/elite_wallets.json", "w") as f:
         json.dump(list(ELITE_WALLETS), f)
-    print(f"💾 Saved {len(ELITE_WALLETS)} elite wallets")
+    
+    # LOG TO CONSOLE (you'll see this in Railway Logs)
+    if ELITE_WALLETS:
+        print("🌟 ELITE WALLETS LIST:")
+        for w in ELITE_WALLETS:
+            print(f"  - {w}")
+        print(f"✅ Total elite wallets: {len(ELITE_WALLETS)}")
+    else:
+        print("⏳ No elite wallets yet — still collecting data...")
 
 def get_trades(mint):
     try:
@@ -33,7 +42,7 @@ def score_wallets():
     global ELITE_WALLETS
     while True:
         time.sleep(CHECK_INTERVAL_SEC)
-        print("🔍 Scoring wallets for profitability...")
+        print("🔍 Scoring wallets for real profits...")
         new_elite = set()
         
         for wallet, buys in WALLET_BUYS.items():
@@ -54,14 +63,15 @@ def score_wallets():
             
             if total >= MIN_TRADES and (wins / total) >= MIN_WIN_RATE:
                 new_elite.add(wallet)
-                if wallet not in ELITE_WALLETS:
-                    print(f"✅ ELITE WALLET PROMOTED: {wallet[:8]}... | Wins: {wins}/{total}")
         
-        ELITE_WALLETS = new_elite
-        save_elite()
+        # Only log if changed
+        if new_elite != ELITE_WALLETS:
+            ELITE_WALLETS = new_elite
+            save_and_log_elite()
+        else:
+            print("📊 No change in elite wallet list.")
 
 async def main():
-    # Start scoring thread
     Thread(target=score_wallets, daemon=True).start()
     
     uri = "wss://pumpportal.fun/api/data"
@@ -70,9 +80,7 @@ async def main():
             async with websockets.connect(uri) as ws:
                 print("✅ Connected to PumpPortal")
                 
-                # Watch ALL new tokens
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                # Watch ALL trades (empty keys = global feed)
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []}))
                 
                 async for message in ws:
@@ -82,15 +90,11 @@ async def main():
                             wallet = data["traderPublicKey"]
                             sol = data["solAmount"]
                             mint = data["mint"]
-                            
-                            # Track significant early buys
                             if sol >= MIN_BUY_SOL:
                                 WALLET_BUYS[wallet].append({"token": mint, "sol": sol})
                                 print(f"🛒 Tracking: {wallet[:8]}... | {sol} SOL | {mint[:8]}...")
-                                
                     except Exception as e:
                         print(f"⚠️ Message error: {e}")
-                        
         except Exception as e:
             print(f"💥 Connection error: {e}")
             await asyncio.sleep(5)
