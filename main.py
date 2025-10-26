@@ -4,96 +4,74 @@ import json
 import requests
 import time
 import threading
-import sqlite3
-import os
+from supabase import create_client
 
-# === PERSISTENT DATABASE SETUP ===
-DB_PATH = "/persistent/wallets.db"
+# === SUPABASE CONFIG ===
+SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZXYiLCJyb2xlIjoiYW5vbiIsImV4cCI6MTc0MjQwOTAwNzA4OH0.eyJpc3MiOiJzdXBhYmFzZS1kZXYiLCJyb2xlIjoiYW5vbiIsImV4cCI6MTc0MjQwOTAwNzA4OH0"supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def init_db():
-    os.makedirs("/persistent", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS wallets (
-            address TEXT PRIMARY KEY,
-            first_seen REAL,
-            last_updated REAL,
-            tokens_traded INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0,
-            total_roi REAL DEFAULT 0.0,
-            status TEXT DEFAULT 'candidate',
-            last_buy_ts REAL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet TEXT,
-            token_mint TEXT,
-            buy_sol REAL,
-            sell_sol REAL,
-            buy_ts REAL,
-            sell_ts REAL,
-            roi REAL,
-            status TEXT DEFAULT 'open'
-        )
-    """)
-    conn.commit()
-    conn.close()
+MIN_BUY_SOL = 0.1
+MIN_TRADES = 3
+MIN_WIN_RATE = 0.6
+MIN_ROI = 2.0
+CHECK_INTERVAL_SEC = 900  # 15 minutes
 
 def save_buy(wallet, token_mint, sol_amount):
-    conn = sqlite3.connect(DB_PATH)
-    ts = time.time()
-    conn.execute("""
-        INSERT INTO trades (wallet, token_mint, buy_sol, buy_ts, status)
-        VALUES (?, ?, ?, ?, 'open')
-    """, (wallet, token_mint, sol_amount, ts))
-    conn.execute("""
-        INSERT OR IGNORE INTO wallets (address, first_seen, last_updated, last_buy_ts)
-        VALUES (?, ?, ?, ?)
-    """, (wallet, ts, ts, ts))
-    conn.commit()
-    conn.close()
+    ts = int(time.time())
+    supabase.table("trades").insert({
+        "wallet": wallet,
+        "token_mint": token_mint,
+        "buy_sol": sol_amount,
+        "buy_ts": ts,
+        "status": "open"
+    }).execute()
+    supabase.table("wallets").upsert({
+        "address": wallet,
+        "first_seen": ts,
+        "last_updated": ts,
+        "last_buy_ts": ts
+    }).execute()
 
 def get_all_wallets():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT address FROM wallets").fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    try:
+        response = supabase.table("wallets").select("address").execute()
+        return [w["address"] for w in response.data]
+    except:
+        return []
 
 def update_wallet_status(wallet, tokens_traded, wins, total_roi, status):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        UPDATE wallets
-        SET tokens_traded = ?, wins = ?, total_roi = ?, status = ?, last_updated = ?
-        WHERE address = ?
-    """, (tokens_traded, wins, total_roi, status, time.time(), wallet))
-    conn.commit()
-    conn.close()
+    try:
+        supabase.table("wallets").update({
+            "tokens_traded": tokens_traded,
+            "wins": wins,
+            "total_roi": total_roi,
+            "status": status,
+            "last_updated": int(time.time())
+        }).eq("address", wallet).execute()
+    except Exception as e:
+        print(f"DB update error: {e}")
 
 def get_open_trades(wallet):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT token_mint, buy_sol, buy_ts FROM trades
-        WHERE wallet = ? AND status = 'open'
-    """, (wallet,)).fetchall()
-    conn.close()
-    return rows
+    try:
+        response = supabase.table("trades").select("token_mint, buy_sol, buy_ts").eq("wallet", wallet).eq("status", "open").execute()
+        return response.data
+    except:
+        return []
 
 def close_trade(wallet, token_mint, sell_sol):
-    conn = sqlite3.connect(DB_PATH)
-    buy = conn.execute("""
-        SELECT buy_sol FROM trades WHERE wallet = ? AND token_mint = ? AND status = 'open'
-    """, (wallet, token_mint)).fetchone()
-    if buy:
-        roi = sell_sol / buy[0] if buy[0] > 0 else 0
-        conn.execute("""
-            UPDATE trades
-            SET sell_sol = ?, sell_ts = ?, roi = ?, status = 'closed'
-            WHERE wallet = ? AND token_mint = ?
-        """, (sell_sol, time.time(), roi, wallet, token_mint))
-    conn.commit()
-    conn.close()
+    try:
+        buy_resp = supabase.table("trades").select("buy_sol").eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
+        if buy_resp.
+            buy_sol = buy_resp.data[0]["buy_sol"]
+            roi = sell_sol / buy_sol if buy_sol > 0 else 0
+            supabase.table("trades").update({
+                "sell_sol": sell_sol,
+                "sell_ts": int(time.time()),
+                "roi": roi,
+                "status": "closed"
+            }).eq("wallet", wallet).eq("token_mint", token_mint).execute()
+    except Exception as e:
+        print(f"Close trade error: {e}")
 
 def get_trades(mint):
     try:
@@ -103,34 +81,29 @@ def get_trades(mint):
         return []
 
 def score_wallets():
-    MIN_TRADES = 3
-    MIN_WIN_RATE = 0.6
-    MIN_ROI = 2.0
     while True:
-        time.sleep(900)  # Every 15 minutes
+        time.sleep(CHECK_INTERVAL_SEC)
         print("🧠 Scoring wallets...")
         try:
             wallets = get_all_wallets()
             for wallet in wallets:
                 open_trades = get_open_trades(wallet)
-                for mint, buy_sol, buy_ts in open_trades:
+                for trade in open_trades:
+                    mint = trade["token_mint"]
                     trades = get_trades(mint)
                     sells = [t for t in trades if t["type"] == "sell" and t["user"] == wallet]
                     if sells:
                         close_trade(wallet, mint, sells[-1]["sol_amount"])
                 
-                conn = sqlite3.connect(DB_PATH)
-                closed = conn.execute("""
-                    SELECT roi FROM trades WHERE wallet = ? AND status = 'closed'
-                """, (wallet,)).fetchall()
-                conn.close()
+                closed_resp = supabase.table("trades").select("roi").eq("wallet", wallet).eq("status", "closed").execute()
+                closed = [r["roi"] for r in closed_resp.data] if closed_resp.data else []
                 
                 if len(closed) < MIN_TRADES:
                     status = "candidate"
                 else:
-                    wins = len([r for r in closed if r[0] >= MIN_ROI])
+                    wins = len([r for r in closed if r >= MIN_ROI])
                     win_rate = wins / len(closed)
-                    avg_roi = sum(r[0] for r in closed) / len(closed) if closed else 0
+                    avg_roi = sum(closed) / len(closed) if closed else 0
                     status = "elite" if win_rate >= MIN_WIN_RATE and avg_roi >= MIN_ROI else "demoted"
                 
                 update_wallet_status(wallet, len(closed), wins, avg_roi, status)
@@ -139,20 +112,18 @@ def score_wallets():
                 elif status == "demoted":
                     print(f"❌ DEMOTED: {wallet}")
             
-            # Log elite list
-            conn = sqlite3.connect(DB_PATH)
-            elite = conn.execute("SELECT address FROM wallets WHERE status = 'elite'").fetchall()
-            conn.close()
+            elite_resp = supabase.table("wallets").select("address").eq("status", "elite").execute()
+            elite = [w["address"] for w in elite_resp.data] if elite_resp.data else []
             if elite:
                 print("🌟 ELITE WALLETS:")
-                for (w,) in elite:
+                for w in elite:
                     print(f"  - {w}")
+            else:
+                print("⏳ No elite wallets yet.")
         except Exception as e:
             print(f"⚠️ Scoring error: {e}")
 
-# === MAIN AI AGENT ===
 async def main():
-    init_db()
     threading.Thread(target=score_wallets, daemon=True).start()
     
     uri = "wss://pumpportal.fun/api/data"
@@ -173,7 +144,7 @@ async def main():
                             wallet = data["traderPublicKey"]
                             sol = data["solAmount"]
                             mint = data["mint"]
-                            if sol >= 0.1:  # Only track ≥0.1 SOL
+                            if sol >= MIN_BUY_SOL:
                                 save_buy(wallet, mint, sol)
                                 print(f"🛒 Tracking: {wallet} | {sol} SOL | {mint}")
                     except Exception as e:
