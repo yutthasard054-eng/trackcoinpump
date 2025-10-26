@@ -1,0 +1,6 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "startCommand": "python ai_agent.py"
+}
