@@ -62,7 +62,7 @@ def get_open_trades(wallet):
 def close_trade(wallet, token_mint, sell_sol):
     try:
         buy_resp = supabase.table("trades").select("buy_sol").eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
-        if buy_resp.
+        if buy_resp.data:
             buy_sol = buy_resp.data[0]["buy_sol"]
             roi = sell_sol / buy_sol if buy_sol > 0 else 0
             supabase.table("trades").update({
