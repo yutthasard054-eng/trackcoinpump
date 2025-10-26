@@ -8,7 +8,8 @@ from supabase import create_client
 
 # === SUPABASE CONFIG ===
 SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZXYiLCJyb2xlIjoiYW5vbiIsImV4cCI6MTc0MjQwOTAwNzA4OH0.eyJpc3MiOiJzdXBhYmFzZS1kZXYiLCJyb2xlIjoiYW5vbiIsImV4cCI6MTc0MjQwOTAwNzA4OH0"supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZXYiLCJyb2xlIjoiYW5vbiIsImV4cCI6MTc0MjQwOTAwNzA4OH0.eyJpc3MiOiJzdXBhYmFzZS1kZXYiLCJyb2xlIjoiYW5vbiIsImV4cCI6MTc0MjQwOTAwNzA4OH0"
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 MIN_BUY_SOL = 0.1
 MIN_TRADES = 3
