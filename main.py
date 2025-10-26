@@ -3,33 +3,97 @@ import websockets
 import json
 import requests
 import time
-from collections import defaultdict
-from threading import Thread
+import threading
+import sqlite3
+import os
 
-# === CONFIG ===
-MIN_BUY_SOL = 0.1
-MIN_TRADES = 3
-MIN_WIN_RATE = 0.6
-MIN_ROI = 2.0
-CHECK_INTERVAL_SEC = 900  # 15 minutes
+# === PERSISTENT DATABASE SETUP ===
+DB_PATH = "/persistent/wallets.db"
 
-# === STATE ===
-WALLET_BUYS = defaultdict(list)
-ELITE_WALLETS = set()
+def init_db():
+    os.makedirs("/persistent", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            address TEXT PRIMARY KEY,
+            first_seen REAL,
+            last_updated REAL,
+            tokens_traded INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            total_roi REAL DEFAULT 0.0,
+            status TEXT DEFAULT 'candidate',
+            last_buy_ts REAL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT,
+            token_mint TEXT,
+            buy_sol REAL,
+            sell_sol REAL,
+            buy_ts REAL,
+            sell_ts REAL,
+            roi REAL,
+            status TEXT DEFAULT 'open'
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-def save_and_log_elite():
-    # Save to file (for future trade executor)
-    with open("/tmp/elite_wallets.json", "w") as f:
-        json.dump(list(ELITE_WALLETS), f)
-    
-    # LOG TO CONSOLE (you'll see this in Railway Logs)
-    if ELITE_WALLETS:
-        print("🌟 ELITE WALLETS LIST:")
-        for w in ELITE_WALLETS:
-            print(f"  - {w}")
-        print(f"✅ Total elite wallets: {len(ELITE_WALLETS)}")
-    else:
-        print("⏳ No elite wallets yet — still collecting data...")
+def save_buy(wallet, token_mint, sol_amount):
+    conn = sqlite3.connect(DB_PATH)
+    ts = time.time()
+    conn.execute("""
+        INSERT INTO trades (wallet, token_mint, buy_sol, buy_ts, status)
+        VALUES (?, ?, ?, ?, 'open')
+    """, (wallet, token_mint, sol_amount, ts))
+    conn.execute("""
+        INSERT OR IGNORE INTO wallets (address, first_seen, last_updated, last_buy_ts)
+        VALUES (?, ?, ?, ?)
+    """, (wallet, ts, ts, ts))
+    conn.commit()
+    conn.close()
+
+def get_all_wallets():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT address FROM wallets").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def update_wallet_status(wallet, tokens_traded, wins, total_roi, status):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        UPDATE wallets
+        SET tokens_traded = ?, wins = ?, total_roi = ?, status = ?, last_updated = ?
+        WHERE address = ?
+    """, (tokens_traded, wins, total_roi, status, time.time(), wallet))
+    conn.commit()
+    conn.close()
+
+def get_open_trades(wallet):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT token_mint, buy_sol, buy_ts FROM trades
+        WHERE wallet = ? AND status = 'open'
+    """, (wallet,)).fetchall()
+    conn.close()
+    return rows
+
+def close_trade(wallet, token_mint, sell_sol):
+    conn = sqlite3.connect(DB_PATH)
+    buy = conn.execute("""
+        SELECT buy_sol FROM trades WHERE wallet = ? AND token_mint = ? AND status = 'open'
+    """, (wallet, token_mint)).fetchone()
+    if buy:
+        roi = sell_sol / buy[0] if buy[0] > 0 else 0
+        conn.execute("""
+            UPDATE trades
+            SET sell_sol = ?, sell_ts = ?, roi = ?, status = 'closed'
+            WHERE wallet = ? AND token_mint = ?
+        """, (sell_sol, time.time(), roi, wallet, token_mint))
+    conn.commit()
+    conn.close()
 
 def get_trades(mint):
     try:
@@ -39,40 +103,57 @@ def get_trades(mint):
         return []
 
 def score_wallets():
-    global ELITE_WALLETS
+    MIN_TRADES = 3
+    MIN_WIN_RATE = 0.6
+    MIN_ROI = 2.0
     while True:
-        time.sleep(CHECK_INTERVAL_SEC)
-        print("🔍 Scoring wallets for real profits...")
-        new_elite = set()
-        
-        for wallet, buys in WALLET_BUYS.items():
-            if len(buys) < MIN_TRADES:
-                continue
+        time.sleep(900)  # Every 15 minutes
+        print("🧠 Scoring wallets...")
+        try:
+            wallets = get_all_wallets()
+            for wallet in wallets:
+                open_trades = get_open_trades(wallet)
+                for mint, buy_sol, buy_ts in open_trades:
+                    trades = get_trades(mint)
+                    sells = [t for t in trades if t["type"] == "sell" and t["user"] == wallet]
+                    if sells:
+                        close_trade(wallet, mint, sells[-1]["sol_amount"])
                 
-            wins = 0
-            total = 0
-            for buy in buys:
-                mint = buy["token"]
-                trades = get_trades(mint)
-                sells = [t for t in trades if t["type"] == "sell" and t["user"] == wallet]
-                if sells:
-                    roi = sells[-1]["sol_amount"] / max(buy["sol"], 1e-9)
-                    if roi >= MIN_ROI:
-                        wins += 1
-                    total += 1
+                conn = sqlite3.connect(DB_PATH)
+                closed = conn.execute("""
+                    SELECT roi FROM trades WHERE wallet = ? AND status = 'closed'
+                """, (wallet,)).fetchall()
+                conn.close()
+                
+                if len(closed) < MIN_TRADES:
+                    status = "candidate"
+                else:
+                    wins = len([r for r in closed if r[0] >= MIN_ROI])
+                    win_rate = wins / len(closed)
+                    avg_roi = sum(r[0] for r in closed) / len(closed) if closed else 0
+                    status = "elite" if win_rate >= MIN_WIN_RATE and avg_roi >= MIN_ROI else "demoted"
+                
+                update_wallet_status(wallet, len(closed), wins, avg_roi, status)
+                if status == "elite":
+                    print(f"✅ ELITE: {wallet}")
+                elif status == "demoted":
+                    print(f"❌ DEMOTED: {wallet}")
             
-            if total >= MIN_TRADES and (wins / total) >= MIN_WIN_RATE:
-                new_elite.add(wallet)
-        
-        # Only log if changed
-        if new_elite != ELITE_WALLETS:
-            ELITE_WALLETS = new_elite
-            save_and_log_elite()
-        else:
-            print("📊 No change in elite wallet list.")
+            # Log elite list
+            conn = sqlite3.connect(DB_PATH)
+            elite = conn.execute("SELECT address FROM wallets WHERE status = 'elite'").fetchall()
+            conn.close()
+            if elite:
+                print("🌟 ELITE WALLETS:")
+                for (w,) in elite:
+                    print(f"  - {w}")
+        except Exception as e:
+            print(f"⚠️ Scoring error: {e}")
 
+# === MAIN AI AGENT ===
 async def main():
-    Thread(target=score_wallets, daemon=True).start()
+    init_db()
+    threading.Thread(target=score_wallets, daemon=True).start()
     
     uri = "wss://pumpportal.fun/api/data"
     while True:
@@ -80,7 +161,9 @@ async def main():
             async with websockets.connect(uri) as ws:
                 print("✅ Connected to PumpPortal")
                 
+                # Subscribe to ALL new tokens
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                # Subscribe to ALL trades (empty keys = global feed)
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []}))
                 
                 async for message in ws:
@@ -90,8 +173,8 @@ async def main():
                             wallet = data["traderPublicKey"]
                             sol = data["solAmount"]
                             mint = data["mint"]
-                            if sol >= MIN_BUY_SOL:
-                                WALLET_BUYS[wallet].append({"token": mint, "sol": sol})
+                            if sol >= 0.1:  # Only track ≥0.1 SOL
+                                save_buy(wallet, mint, sol)
                                 print(f"🛒 Tracking: {wallet} | {sol} SOL | {mint}")
                     except Exception as e:
                         print(f"⚠️ Message error: {e}")
