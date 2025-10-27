@@ -68,7 +68,6 @@ def setup_logging():
 
 async def get_market_cap_async(token_mint):
     """Fetches the current market cap for a given token using a thread pool executor."""
-    # Use asyncio.to_thread to run the blocking requests.get in a separate thread
     return await asyncio.to_thread(get_market_cap, token_mint)
 
 def get_market_cap(token_mint):
@@ -87,8 +86,6 @@ def get_market_cap(token_mint):
         return 0.0
 
 # === 3. AI MODEL FUNCTIONS (ASYNC-SAFE) ===
-
-# All blocking AI/DB functions are now run via asyncio.to_thread in the main logic
 
 def load_training_data():
     """Fetches and prepares data for model training (BLOCKING I/O)."""
@@ -168,8 +165,6 @@ async def save_buy_async(wallet, token_mint, sol_amount):
 def save_buy(wallet, token_mint, sol_amount):
     """Synchronous buy save (runs in executor)."""
     ts = int(time.time())
-    # CRITICAL FIX: get_market_cap is blocking, but it's safe to call here 
-    # because this entire function is already running in a separate thread via asyncio.to_thread
     market_cap = get_market_cap(token_mint)
 
     try:
@@ -236,22 +231,17 @@ def save_sell(wallet, token_mint, sol_amount):
 async def score_wallets_async():
     """Runs periodically to train the model, calculate features, and predict scores."""
     
-    # CRITICAL FIX: Start the training in the executor before the loop
     await asyncio.to_thread(train_model) 
     
     while True:
-        # CRITICAL FIX: Use await asyncio.sleep to not block the event loop
         await asyncio.sleep(CHECK_INTERVAL_SEC) 
         logger.info("🧠 Scoring wallets and generating features...")
         
         try:
-            # CRITICAL FIX: Database calls must be awaited
             wallets = await get_all_wallets_async()
             ready_to_predict = {} 
 
             for wallet in wallets:
-                
-                # CRITICAL FIX: Feature calculation involving DB is blocking, run in executor
                 
                 def calculate_features(wallet):
                     """Synchronous logic to be run in a separate thread."""
@@ -308,7 +298,6 @@ async def score_wallets_async():
                 logger.info("AI Predictor: Starting live scoring...")
                 for wallet, (features, wins, total_roi) in ready_to_predict.items():
                     
-                    # CRITICAL FIX: Prediction is blocking, run in executor
                     elite_probability = await asyncio.to_thread(predict_wallet_score, features)
                     
                     if elite_probability >= 0.90:  
@@ -324,7 +313,7 @@ async def score_wallets_async():
                     
                     logger.info(f"🧠 AI Score for {wallet}: {elite_probability:.4f} -> {status}")
 
-            # Log elite list (CRITICAL FIX: Database calls must be awaited)
+            # Log elite list
             elite_resp = await asyncio.to_thread(supabase.table("wallets").select("address, total_roi, elite_probability").eq("status", "elite").execute)
             elite = elite_resp.data if elite_resp.data else []
             if elite:
@@ -337,18 +326,18 @@ async def score_wallets_async():
         except Exception as e:
             logger.critical(f"⚠️ Critical Scoring Error: {e}", exc_info=True)
 
-# === 6. WEBSOCKET LISTENER ===
+# === 6. WEBSOCKET LISTENER (URL FIX APPLIED HERE) ===
 
 async def ws_listener():
-    WS_URL = "wss://client-api-v2-wss.pump.fun/trades"
+    # FIX APPLIED HERE: Corrected the hostname which was causing the socket.gaierror
+    WS_URL = "wss://client-api-v2.pump.fun/trades" # Corrected the URL by removing the extra '-wss'
     logger.info("Connecting to pump.fun websocket. Subscribing to all trades...")
     
-    # CRITICAL FIX: Use asyncio.create_task to run the scoring loop concurrently
-    # This replaces the unreliable threading.Thread(target=score_wallets) 
     asyncio.create_task(score_wallets_async()) 
     
     while True:
         try:
+            # The error traceback points directly to this line failing due to hostname resolution
             async with websockets.connect(WS_URL) as websocket:
                 
                 while True:
@@ -364,11 +353,9 @@ async def ws_listener():
                     wallet = data["data"].get("wallet")
                     
                     if trade_type == "BUY" and sol_amount >= MIN_BUY_SOL:
-                        # CRITICAL FIX: Await the async save_buy function
                         await save_buy_async(wallet, token_mint, sol_amount)
                         
                     elif trade_type == "SELL":
-                        # CRITICAL FIX: Await the async save_sell function
                         await save_sell_async(wallet, token_mint, sol_amount)
                         
         except websockets.exceptions.ConnectionClosedOK:
