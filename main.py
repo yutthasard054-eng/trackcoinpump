@@ -8,8 +8,8 @@ from supabase import create_client
 
 # === SUPABASE CONFIG ===
 SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"
-# The provided key has been inserted below
-SUPABASE_KEY = "sb_publishable_mzev_Afhu-zljQBFdcwNVQ_026z-b8Q"
+# The provided service_role key has been inserted below
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBudnZubGNvb3lrb3FvZWJnZm9tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTUwNTkyNywiZXhwIjoyMDc3MDgxOTI3fQ.rj4w2ohncSKrBmArNvxuhP-aTv-nKKqyE_An1WQrnwo"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 MIN_BUY_SOL = 0.1
@@ -84,8 +84,8 @@ def score_wallets():
                 if not open_trades.data:
                     continue
 
-                # FIX: Added .data and the colon (:) to resolve the previous SyntaxError
-                for trade in open_trades.data:
+                # FIX for SyntaxError: Added .data and the colon (:) 
+                for trade in open_trades.data: 
                     mint = trade["token_mint"]
                     buy_sol = trade["buy_sol"]
                     api_trades = get_trades_from_api(mint)
@@ -147,9 +147,6 @@ async def main():
                                 save_buy(wallet, mint, sol)
                                 print(f"🛒 Tracking: {wallet} | {sol} SOL | {mint}")
                     except Exception as e:
-                        # This error block was catching the Supabase API key error, 
-                        # but it was incorrectly reported as a "Message error".
-                        # With the key fixed, this block will now primarily catch WebSocket message processing errors.
                         print(f"⚠️ Message error: {e}")
         except Exception as e:
             print(f"💥 Connection error: {e}")
