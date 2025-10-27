@@ -31,11 +31,13 @@ if not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # === CONFIG & ML SETUP ===
-MIN_BUY_SOL = 0.5   
-MIN_TRADES = 5      
-MIN_ROI = 3.0       
-ELITE_THRESHOLD = 0.90
-CHECK_INTERVAL_SEC = 1800
+MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))  # LOWERED from 0.5 to 0.1
+MIN_TRADES = int(os.getenv("MIN_TRADES", "5"))
+MIN_ROI = float(os.getenv("MIN_ROI", "3.0"))
+ELITE_THRESHOLD = float(os.getenv("ELITE_THRESHOLD", "0.90"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "1800"))
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"  # NEW: Debug mode
+
 TOKEN_INFO_URL = "https://frontend-api.pump.fun/trades/"
 TOKEN_DATA_URL = "https://frontend-api.pump.fun/coins/"
 MODEL_FILE = 'elite_wallet_model.pkl'
@@ -43,6 +45,15 @@ SCALER_FILE = 'scaler.pkl'
 logger = logging.getLogger("PumpAI")
 
 executor = ThreadPoolExecutor(max_workers=5) 
+
+# Track stats
+stats = {
+    "messages_received": 0,
+    "buys_tracked": 0,
+    "sells_detected": 0,
+    "errors": 0,
+    "start_time": time.time()
+}
 
 def cleanup_executor():
     logger.info("Shutting down executor...")
@@ -55,7 +66,7 @@ atexit.register(cleanup_executor)
 def setup_logging():
     log_queue = queue.Queue(-1)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)  # Debug level
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
@@ -209,11 +220,13 @@ def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
         }, on_conflict="address").execute()
         
         logger.info(f"🛒 Tracking Buy: {wallet[:8]}... | {sol_amount:.2f} SOL | MC: ${market_cap:,.0f}")
+        stats["buys_tracked"] += 1
         return True
     except Exception as e:
         if "23505" in str(e):
             return True
         logger.error(f"DB Error (save_buy): {e}", exc_info=True)
+        stats["errors"] += 1
         return False
 
 async def save_buy_async(wallet, token_mint, sol_amount, market_cap):
@@ -245,8 +258,10 @@ def _close_trade_in_db_sync(wallet, token_mint, sell_sol, buy_sol):
         }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
         
         logger.info(f"💰 Closed: {wallet[:8]}... | {token_mint[:8]}... | ROI: {roi:.2f}x")
+        stats["sells_detected"] += 1
     except Exception as e:
         logger.error(f"DB Error (close_trade): {e}", exc_info=True)
+        stats["errors"] += 1
 
 async def close_trade_in_db_async(wallet, token_mint, sell_sol, buy_sol):
     await asyncio.get_event_loop().run_in_executor(
@@ -286,6 +301,10 @@ async def score_wallets_async():
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
         logger.info("🧠 AI Scoring: Starting scoring cycle...")
+        
+        # Print stats
+        uptime = time.time() - stats["start_time"]
+        logger.info(f"📊 Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']} | Uptime={uptime/3600:.1f}h")
         
         trained = await asyncio.get_event_loop().run_in_executor(executor, train_model)
         
@@ -413,13 +432,14 @@ async def score_wallets_async():
                 
         except Exception as e:
             logger.error(f"❌ Critical AI Scoring Error: {e}", exc_info=True)
+            stats["errors"] += 1
 
-# === 6. WEBSOCKET LISTENER ===
+# === 6. WEBSOCKET LISTENER (ENHANCED WITH DEBUG) ===
 
 open_trades_cache = {}
 
 async def ws_listener():
-    """Main websocket listener with sell detection."""
+    """Main websocket listener with enhanced debugging."""
     uri = "wss://pumpportal.fun/api/data"
     
     if not hasattr(ws_listener, 'scorer_started'):
@@ -435,15 +455,36 @@ async def ws_listener():
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []})) 
                 logger.info("🚀 Subscribed to token trades stream")
                 
+                message_count = 0
+                last_sample_time = time.time()
+                
                 async for message in ws:
                     try:
+                        stats["messages_received"] += 1
+                        message_count += 1
+                        
+                        # Log sample message every 10 seconds
+                        current_time = time.time()
+                        if current_time - last_sample_time > 10:
+                            logger.info(f"📡 Received {message_count} messages in last 10s")
+                            message_count = 0
+                            last_sample_time = current_time
+                        
                         data = json.loads(message)
                         event_method = data.get("method")
-                        trade_data = data.get("data", {}) 
+                        trade_data = data.get("data", {})
+                        
+                        # DEBUG: Log first few messages to see structure
+                        if stats["messages_received"] <= 3:
+                            logger.info(f"🔍 SAMPLE MESSAGE #{stats['messages_received']}: {json.dumps(data)[:300]}")
 
                         if event_method == "tokenTrade" and trade_data:
                             tx_type = trade_data.get("txType", "").lower()
                             sol_amount_str = trade_data.get("sol_amount")
+                            
+                            # DEBUG: Log what we're seeing
+                            if DEBUG_MODE and stats["messages_received"] % 50 == 0:
+                                logger.debug(f"🔍 Trade data: txType={tx_type}, sol_amount={sol_amount_str}")
                             
                             if sol_amount_str is None: 
                                 continue
@@ -451,15 +492,20 @@ async def ws_listener():
                             try:
                                 sol_amount = float(sol_amount_str)
                             except (ValueError, TypeError):
+                                logger.warning(f"⚠️ Invalid SOL amount: {sol_amount_str}")
                                 continue 
                                 
                             token_mint = trade_data.get("mint")
                             wallet = trade_data.get("user")
                             
                             if not token_mint or not wallet:
+                                if DEBUG_MODE:
+                                    logger.debug(f"⚠️ Missing mint or wallet: mint={token_mint}, wallet={wallet}")
                                 continue
                             
                             if tx_type == "buy" and sol_amount >= MIN_BUY_SOL:
+                                logger.info(f"🎯 BUY DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
+                                
                                 market_cap = await asyncio.get_event_loop().run_in_executor(
                                     executor, get_token_market_cap, token_mint
                                 )
@@ -471,6 +517,7 @@ async def ws_listener():
                                     open_trades_cache[cache_key] = sol_amount
                                     
                             elif tx_type == "sell":
+                                logger.info(f"💸 SELL DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
                                 cache_key = f"{wallet}:{token_mint}"
                                 
                                 if cache_key in open_trades_cache:
@@ -489,14 +536,17 @@ async def ws_listener():
                                         
                     except json.JSONDecodeError:
                         logger.warning(f"Failed to decode message: {message[:100]}...")
+                        stats["errors"] += 1
                     except Exception as e:
-                        logger.error(f"Message Processing Error: {e}", exc_info=False)
+                        logger.error(f"Message Processing Error: {e}", exc_info=True)
+                        stats["errors"] += 1
                         
         except websockets.exceptions.ConnectionClosed:
             logger.warning("⚠️ Websocket closed. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"❌ WebSocket Connection Error: {e}. Reconnecting in 10 seconds...", exc_info=False)
+            logger.error(f"❌ WebSocket Connection Error: {e}. Reconnecting in 10 seconds...", exc_info=True)
+            stats["errors"] += 1
             await asyncio.sleep(10)
 
 # === 7. MAIN ENTRY POINT ===
@@ -504,10 +554,11 @@ async def ws_listener():
 if __name__ == "__main__":
     setup_logging()
     logger.info("="*60)
-    logger.info("🤖 SUPER AI AGENT STARTING")
+    logger.info("🤖 SUPER AI AGENT STARTING (DEBUG MODE)")
     logger.info("="*60)
     logger.info(f"📊 Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
     logger.info(f"🎯 Elite Threshold: {ELITE_THRESHOLD:.0%}")
+    logger.info(f"🐛 Debug Mode: {DEBUG_MODE}")
     logger.info("="*60)
     
     try:
@@ -518,3 +569,46 @@ if __name__ == "__main__":
         logger.critical(f"💥 Fatal error: {e}", exc_info=True)
     finally:
         logger.info("👋 Shutdown complete.")
+        logger.info(f"📊 Final Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']}")
+```
+
+---
+
+## 🎯 **What's New in This Version:**
+
+### ✅ **1. Lowered Threshold**
+- **MIN_BUY_SOL = 0.1** (was 0.5)
+- Will catch WAY more trades
+
+### ✅ **2. Enhanced Debug Logging**
+- Shows first 3 messages received
+- Logs sample messages every 10 seconds
+- Shows BUY/SELL detections with details
+- Tracks statistics (messages, buys, sells, errors)
+
+### ✅ **3. Stats Tracking**
+```
+📊 Stats: Messages=1250 | Buys=45 | Sells=12 | Errors=0 | Uptime=1.5h
+```
+
+### ✅ **4. Better Error Handling**
+- All errors logged with stack traces
+- Error counter tracks issues
+- More descriptive warnings
+
+### ✅ **5. Message Flow Visibility**
+```
+📡 Received 87 messages in last 10s
+🎯 BUY DETECTED: abc123... | 0.15 SOL | Token: xyz789...
+🛒 Tracking Buy: abc123... | 0.15 SOL | MC: $12,500
+```
+
+### ✅ **6. Environment Variable Support**
+Can customize everything via Railway variables:
+```
+MIN_BUY_SOL=0.1
+MIN_TRADES=5
+MIN_ROI=3.0
+ELITE_THRESHOLD=0.90
+DEBUG_MODE=true
+```
