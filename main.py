@@ -48,7 +48,8 @@ stats = {
     "buys_tracked": 0,
     "sells_detected": 0,
     "errors": 0,
-    "start_time": time.time()
+    "start_time": time.time(),
+    "field_samples": []  # Store samples of actual fields we see
 }
 
 def cleanup_executor():
@@ -304,7 +305,9 @@ async def score_wallets_async():
                         if resp.status_code != 200: 
                             return []
                         trades = resp.json()
-                        sells = [t for t in trades if t.get("txType") == "sell" and t.get("user") == wallet]
+                        # Try both field name variants
+                        sells = [t for t in trades if t.get("txType") == "sell" and 
+                                (t.get("user") == wallet or t.get("traderPublicKey") == wallet)]
                         return sells
                     except Exception as e:
                         logger.debug(f"Error checking sells for {mint}: {e}")
@@ -313,7 +316,11 @@ async def score_wallets_async():
                 sells = await asyncio.get_event_loop().run_in_executor(executor, check_sells)
                 
                 if sells:
-                    await close_trade_in_db_async(wallet, mint, sells[-1]["sol_amount"], buy_sol)
+                    # Try to get sol_amount with multiple field name possibilities
+                    sell_amount = (sells[-1].get("sol_amount") or 
+                                 sells[-1].get("solAmount") or 
+                                 sells[-1].get("sol") or 0)
+                    await close_trade_in_db_async(wallet, mint, sell_amount, buy_sol)
             
             wallets_resp = await asyncio.get_event_loop().run_in_executor(
                 executor, supabase.table("wallets").select("address").execute
@@ -414,6 +421,59 @@ async def score_wallets_async():
 
 open_trades_cache = {}
 
+def extract_trade_data(data):
+    """
+    Extract trade data with flexible field name handling.
+    PumpPortal API may use different field names - this tries multiple variants.
+    """
+    # The message might be wrapped or direct
+    if isinstance(data, dict):
+        # Check if it's wrapped in a "data" field
+        if "data" in data and isinstance(data["data"], dict):
+            trade_data = data["data"]
+        else:
+            trade_data = data
+            
+        # Extract fields with multiple possible names
+        tx_type = (trade_data.get("txType") or 
+                  trade_data.get("type") or 
+                  trade_data.get("tx_type") or "").lower()
+        
+        # Wallet address - try multiple field names
+        wallet = (trade_data.get("traderPublicKey") or 
+                 trade_data.get("user") or 
+                 trade_data.get("wallet") or 
+                 trade_data.get("trader"))
+        
+        # Token mint address
+        token_mint = (trade_data.get("mint") or 
+                     trade_data.get("token") or 
+                     trade_data.get("tokenMint"))
+        
+        # SOL amount - try multiple field names
+        sol_amount_raw = (trade_data.get("solAmount") or 
+                         trade_data.get("sol_amount") or 
+                         trade_data.get("sol") or 
+                         trade_data.get("amount"))
+        
+        # Convert to float if it exists
+        sol_amount = None
+        if sol_amount_raw is not None:
+            try:
+                sol_amount = float(sol_amount_raw)
+            except (ValueError, TypeError):
+                sol_amount = None
+                
+        return {
+            "tx_type": tx_type,
+            "wallet": wallet,
+            "token_mint": token_mint,
+            "sol_amount": sol_amount,
+            "raw_data": trade_data  # Keep raw data for debugging
+        }
+    
+    return None
+
 async def ws_listener():
     uri = "wss://pumpportal.fun/api/data"
     
@@ -426,9 +486,10 @@ async def ws_listener():
             async with websockets.connect(uri) as ws:
                 logger.info("Connected to PumpPortal WebSocket")
                 
-                await ws.send(json.dumps({"method": "subscribeNewToken"})) 
-                await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []})) 
-                logger.info("Subscribed to token trades stream")
+                # Subscribe to new tokens and all trades
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []}))
+                logger.info("Subscribed to token trades stream (all trades)")
                 
                 message_count = 0
                 last_sample_time = time.time()
@@ -438,6 +499,7 @@ async def ws_listener():
                         stats["messages_received"] += 1
                         message_count += 1
                         
+                        # Log first 20 raw messages for debugging
                         if stats["messages_received"] <= 20:
                             logger.info(f"RAW MESSAGE #{stats['messages_received']}: {message[:600]}")
                         
@@ -448,31 +510,34 @@ async def ws_listener():
                             last_sample_time = current_time
                         
                         data = json.loads(message)
+                        
+                        # Store sample of fields for first few messages
+                        if len(stats["field_samples"]) < 10 and isinstance(data, dict):
+                            stats["field_samples"].append(list(data.keys()))
+                            logger.info(f"Message fields sample: {list(data.keys())}")
+                        
+                        # Check if this is a trade event
                         event_method = data.get("method")
-                        trade_data = data.get("data", {})
-
-                        if event_method == "tokenTrade" and trade_data:
-                            tx_type = trade_data.get("txType", "").lower()
-                            sol_amount_str = trade_data.get("sol_amount")
+                        
+                        if event_method == "tokenTrade" or "txType" in data or "tx_type" in data:
+                            # Extract trade data with flexible field names
+                            trade_info = extract_trade_data(data)
+                            
+                            if not trade_info:
+                                continue
+                                
+                            tx_type = trade_info["tx_type"]
+                            sol_amount = trade_info["sol_amount"]
+                            token_mint = trade_info["token_mint"]
+                            wallet = trade_info["wallet"]
                             
                             if DEBUG_MODE and stats["buys_tracked"] < 5:
-                                logger.debug(f"Trade data: txType={tx_type}, sol_amount={sol_amount_str}")
+                                logger.debug(f"Extracted: txType={tx_type}, sol={sol_amount}, wallet={wallet[:8] if wallet else None}...")
                             
-                            if sol_amount_str is None: 
-                                continue
-
-                            try:
-                                sol_amount = float(sol_amount_str)
-                            except (ValueError, TypeError):
-                                logger.warning(f"Invalid SOL amount: {sol_amount_str}")
-                                continue 
-                                
-                            token_mint = trade_data.get("mint")
-                            wallet = trade_data.get("user")
-                            
-                            if not token_mint or not wallet:
+                            # Validate we have required fields
+                            if not token_mint or not wallet or sol_amount is None:
                                 if DEBUG_MODE and stats["messages_received"] <= 50:
-                                    logger.debug(f"Missing mint or wallet: mint={token_mint}, wallet={wallet}")
+                                    logger.debug(f"Missing required fields: mint={token_mint}, wallet={wallet}, sol={sol_amount}")
                                 continue
                             
                             if tx_type == "buy" and sol_amount >= MIN_BUY_SOL:
@@ -511,6 +576,8 @@ async def ws_listener():
                         stats["errors"] += 1
                     except Exception as e:
                         logger.error(f"Message Processing Error: {e}", exc_info=True)
+                        if DEBUG_MODE:
+                            logger.error(f"Problematic message: {message[:500]}")
                         stats["errors"] += 1
                         
         except websockets.exceptions.ConnectionClosed:
@@ -529,7 +596,7 @@ if __name__ == "__main__":
     logger.info(f"Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
     logger.info(f"Elite Threshold: {ELITE_THRESHOLD:.0%}")
     logger.info(f"Debug Mode: {DEBUG_MODE}")
-    logger.info(f"Will log first 20 RAW messages to diagnose data format")
+    logger.info(f"Will log first 20 RAW messages and field structures to diagnose format")
     logger.info("="*60)
     
     try:
@@ -541,3 +608,5 @@ if __name__ == "__main__":
     finally:
         logger.info("Shutdown complete.")
         logger.info(f"Final Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']}")
+        if stats["field_samples"]:
+            logger.info(f"Field samples collected: {stats['field_samples'][:5]}")
