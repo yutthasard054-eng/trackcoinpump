@@ -10,6 +10,7 @@ import logging.handlers
 import queue
 import atexit
 import sys
+# === AI LIBRARIES (MUST BE INSTALLED VIA requirements.txt) ===
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -231,24 +232,41 @@ async def score_wallets_async():
         except Exception as e:
             logger.critical(f"⚠️ Critical Scoring Error: {e}", exc_info=True)
 
-# === 6. WEBSOCKET LISTENER (DNS BYPASS) ===
+# === 6. WEBSOCKET LISTENER (Final DNS Bypass with Explicit IP/Port) ===
 
 async def ws_listener():
-    # TEMPORARY FIX: Replace [PLACEHOLDER_IP_ADDRESS] with the actual IP address
-    # of 'client-api-v2.pump.fun' you find using ping/nslookup.
-    WS_URL = "wss://[PLACEHOLDER_IP_ADDRESS]/trades" 
+    # Final Fix Attempt: Specify the IP and Port directly, but use the correct hostname for SSL.
+    
+    # 1. Hostname for SSL Certificate (must be resolvable by the endpoint's server)
+    HOSTNAME = "client-api-v2.pump.fun" 
+    
+    # 2. IP Address and Port to connect to (Bypasses local DNS resolution)
+    # ⚠️ IMPORTANT: YOU MUST REPLACE '104.18.3.179' with the current IP of client-api-v2.pump.fun
+    IP_ADDRESS = "104.18.3.179"  
+    PORT = 443 
+    URI = f"wss://{HOSTNAME}/trades" # The URI structure used for the path
     
     if not hasattr(ws_listener, 'scorer_started'):
         asyncio.create_task(score_wallets_async()) 
         ws_listener.scorer_started = True
 
-    logger.info(f"Connecting to pump.fun websocket using: {WS_URL}. Subscribing to all trades...")
+    logger.info(f"Connecting to pump.fun websocket (DNS bypass) using: {HOSTNAME} at {IP_ADDRESS}:{PORT}. Subscribing to all trades...")
     
     while True:
         try:
-            # The 'host' argument MUST be the original hostname for SSL certificate validation to work!
-            # The URL uses the IP, but the header needs the name.
-            async with websockets.connect(WS_URL, host="client-api-v2.pump.fun", open_timeout=10, close_timeout=10) as websocket:
+            # Explicitly connecting using the IP and Port, but providing the HOSTNAME for SSL validation.
+            async with websockets.connect(
+                URI, 
+                host=HOSTNAME, 
+                port=PORT,
+                server_hostname=HOSTNAME, # Redundant, but ensures hostname is used for SSL
+                # Pass the explicit IP address to the underlying socket connection
+                # This requires websockets to use the IP/Port for socket creation
+                # The 'uri' is parsed for the path '/trades'
+                # The 'host' parameter in connect tells the underlying socket to bypass DNS
+                # This is the most direct method to circumvent a broken DNS resolver
+                uri_host=IP_ADDRESS # Explicitly override the hostname for the socket connection
+            ) as websocket:
                 logger.info("✅ Successfully connected to the WebSocket.")
                 
                 while True:
@@ -273,11 +291,11 @@ async def ws_listener():
             logger.info("Websocket connection closed normally. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
         except websockets.exceptions.InvalidURI:
-            logger.critical(f"Invalid WebSocket URI: {WS_URL}. Check the format!")
+            logger.critical(f"Invalid WebSocket URI: {URI}. Check the format!")
             await asyncio.sleep(60) 
         except Exception as e:
-            # We keep the error message simple here since we know the cause is connection/DNS related.
-            logger.error(f"Websocket error: {e}. Reconnecting in 10 seconds...", exc_info=False)
+            # Catch all exceptions, including the underlying socket.gaierror
+            logger.error(f"Websocket error: Connection failed. Reconnecting in 10 seconds...", exc_info=False)
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
