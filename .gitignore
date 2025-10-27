@@ -1,4 +1,4 @@
-# Environment variables (NEVER COMMIT THIS!)
+# Environment variables
 .env
 
 # Python
@@ -23,7 +23,7 @@ wheels/
 .installed.cfg
 *.egg
 
-# Machine Learning Models (can be large)
+# ML Models
 *.pkl
 *.joblib
 elite_wallet_model.pkl
@@ -49,8 +49,3 @@ Thumbs.db
 # Logs
 *.log
 logs/
-
-# Database backups
-*.sql.backup
-*.db
-*.sqlite
