@@ -33,7 +33,7 @@ MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))
 MIN_TRADES = int(os.getenv("MIN_TRADES", "5"))
 MIN_ROI = float(os.getenv("MIN_ROI", "3.0"))
 ELITE_THRESHOLD = float(os.getenv("ELITE_THRESHOLD", "0.90"))
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "1800"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # Reduced to 5 minutes for more frequent sell checks
 
 logger = logging.getLogger("PumpAI")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
@@ -50,7 +50,7 @@ def save_buy(wallet, token_mint, sol_amount, market_cap=0):
         supabase.table("wallets").upsert({
             "address": wallet, "first_seen": ts, "last_updated": ts
         }).execute()
-        logger.info(f"🛒 Tracking Buy: {wallet} | {sol_amount} SOL | {token_mint}")
+        logger.info(f"🛒 Tracking Buy: {wallet[:12]}... | {sol_amount} SOL | {token_mint[:12]}...")
         return True
     except Exception as e:
         if "23505" in str(e): return True
@@ -63,13 +63,15 @@ def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol):
         supabase.table("trades").update({
             "sell_sol": sell_sol, "sell_ts": int(time.time()), "roi": roi, "status": "closed"
         }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
-        logger.info(f"💰 Closed: {wallet} | {token_mint} | ROI: {roi:.2f}x")
+        logger.info(f"💰 SELL DETECTED: {wallet[:12]}... | {token_mint[:12]}... | ROI: {roi:.2f}x")
+        return True
     except Exception as e:
         logger.error(f"DB Error (close_trade): {e}")
+        return False
 
 def get_open_trades():
     try:
-        resp = supabase.table("trades").select("id, wallet, token_mint, buy_sol").eq("status", "open").execute()
+        resp = supabase.table("trades").select("id, wallet, token_mint, buy_sol, buy_ts").eq("status", "open").execute()
         return resp.data if resp.data else []
     except Exception as e:
         logger.error(f"DB Error (get_open_trades): {e}")
@@ -86,6 +88,49 @@ def update_wallet_status(wallet, tokens_traded, wins, total_roi, status, elite_p
         supabase.table("wallets").update(data).eq("address", wallet).execute()
     except Exception as e:
         logger.error(f"DB Error (update_wallet_status): {e}")
+
+# === SELL DETECTION ===
+def check_for_sells():
+    """Actively check for sells on all open trades"""
+    open_trades = get_open_trades()
+    if not open_trades:
+        return
+    
+    logger.info(f"🔍 Checking {len(open_trades)} open trades for sells...")
+    sells_found = 0
+    
+    for trade in open_trades:
+        mint = trade["token_mint"]
+        wallet = trade["wallet"]
+        buy_sol = trade["buy_sol"]
+        buy_ts = trade["buy_ts"]
+        
+        try:
+            # Get recent trades for this token
+            resp = requests.get(f"https://frontend-api.pump.fun/trades/{mint}?limit=50", timeout=5)
+            if resp.status_code != 200: 
+                continue
+                
+            trades = resp.json()
+            
+            # Look for sells by this wallet after the buy timestamp
+            for t in trades:
+                if (t.get("type") == "sell" and 
+                    t.get("user") == wallet and 
+                    t.get("timestamp", 0) > buy_ts):
+                    
+                    sell_sol = t.get("sol_amount", 0)
+                    if close_trade_in_db(wallet, mint, sell_sol, buy_sol):
+                        sells_found += 1
+                    break  # Only process the most recent sell
+                    
+        except Exception as e:
+            logger.debug(f"Error checking sells for {mint[:12]}: {e}")
+    
+    if sells_found > 0:
+        logger.info(f"✅ Found and closed {sells_found} sell(s)")
+    else:
+        logger.info("❌ No new sells found in this cycle")
 
 # === MACHINE LEARNING FUNCTIONS ===
 def load_training_data():
@@ -175,6 +220,18 @@ def debug_ai_status():
             for status, count in status_counts.items():
                 logger.info(f"  {status}: {count}")
             
+            # Check trades
+            trades_resp = supabase.table("trades").select("status").execute()
+            trades = trades_resp.data if trades_resp.data else []
+            trade_counts = {}
+            for t in trades:
+                status = t.get("status", "unknown")
+                trade_counts[status] = trade_counts.get(status, 0) + 1
+            
+            logger.info(f"📈 Trade Distribution:")
+            for status, count in trade_counts.items():
+                logger.info(f"  {status}: {count}")
+            
             # Show elite probabilities
             elite_wallets = [w for w in wallets if w.get("status") == "elite"]
             if elite_wallets:
@@ -198,23 +255,8 @@ def score_wallets():
         logger.info("="*60)
         
         try:
-            # Check for sells
-            open_trades = get_open_trades()
-            logger.info(f"Checking {len(open_trades)} open trades for sells...")
-            
-            for trade in open_trades:
-                mint = trade["token_mint"]
-                wallet = trade["wallet"]
-                buy_sol = trade["buy_sol"]
-                try:
-                    resp = requests.get(f"https://frontend-api.pump.fun/trades/{mint}?limit=100", timeout=5)
-                    if resp.status_code != 200: continue
-                    trades = resp.json()
-                    sells = [t for t in trades if t["type"] == "sell" and t["user"] == wallet]
-                    if sells:
-                        close_trade_in_db(wallet, mint, sells[-1]["sol_amount"], buy_sol)
-                except Exception as e:
-                    logger.error(f"API Error for {mint}: {e}")
+            # Check for sells more frequently
+            check_for_sells()
             
             # Update wallet stats
             wallets_resp = supabase.table("wallets").select("address").execute()
@@ -358,6 +400,7 @@ if __name__ == "__main__":
     logger.info(f"🎯 Elite Threshold: {ELITE_THRESHOLD:.0%}")
     logger.info(f"🤖 ML Available: {ML_AVAILABLE}")
     logger.info(f"📊 Scoring Interval: {CHECK_INTERVAL_SEC} seconds")
+    logger.info(f"🔍 Active Sell Detection: ENABLED")
     logger.info("="*60)
     
     try:
