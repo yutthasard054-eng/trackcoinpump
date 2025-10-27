@@ -475,6 +475,7 @@ def extract_trade_data(data):
     return None
 
 async def ws_listener():
+    # Updated WebSocket endpoint based on current API
     uri = "wss://pumpportal.fun/api/data"
     
     if not hasattr(ws_listener, 'scorer_started'):
@@ -486,10 +487,10 @@ async def ws_listener():
             async with websockets.connect(uri) as ws:
                 logger.info("Connected to PumpPortal WebSocket")
                 
-                # Subscribe to new tokens and all trades
+                # Updated subscription methods based on current API
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []}))
-                logger.info("Subscribed to token trades stream (all trades)")
+                await ws.send(json.dumps({"method": "subscribeTokenTrades"}))
+                logger.info("Subscribed to token trades stream")
                 
                 message_count = 0
                 last_sample_time = time.time()
@@ -519,7 +520,8 @@ async def ws_listener():
                         # Check if this is a trade event
                         event_method = data.get("method")
                         
-                        if event_method == "tokenTrade" or "txType" in data or "tx_type" in data:
+                        # Handle different message formats
+                        if event_method == "tokenTrade" or event_method == "trade" or "txType" in data:
                             # Extract trade data with flexible field names
                             trade_info = extract_trade_data(data)
                             
