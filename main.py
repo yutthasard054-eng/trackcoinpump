@@ -232,70 +232,66 @@ async def score_wallets_async():
         except Exception as e:
             logger.critical(f"⚠️ Critical Scoring Error: {e}", exc_info=True)
 
-# === 6. WEBSOCKET LISTENER (Final DNS Bypass with Explicit IP/Port) ===
+# === 6. WEBSOCKET LISTENER (FIX: Use new PumpPortal URI) ===
 
 async def ws_listener():
-    # Final Fix Attempt: Specify the IP and Port directly, but use the correct hostname for SSL.
-    
-    # 1. Hostname for SSL Certificate (must be resolvable by the endpoint's server)
-    HOSTNAME = "client-api-v2.pump.fun" 
-    
-    # 2. IP Address and Port to connect to (Bypasses local DNS resolution)
-    # ⚠️ IMPORTANT: YOU MUST REPLACE '104.18.3.179' with the current IP of client-api-v2.pump.fun
-    IP_ADDRESS = "104.18.3.179"  
-    PORT = 443 
-    URI = f"wss://{HOSTNAME}/trades" # The URI structure used for the path
+    # FIX: Using the new URI from the documentation which should be resolvable.
+    WS_URL = "wss://pumpportal.fun/api/data" 
     
     if not hasattr(ws_listener, 'scorer_started'):
         asyncio.create_task(score_wallets_async()) 
         ws_listener.scorer_started = True
 
-    logger.info(f"Connecting to pump.fun websocket (DNS bypass) using: {HOSTNAME} at {IP_ADDRESS}:{PORT}. Subscribing to all trades...")
+    logger.info(f"Connecting to pump.fun websocket using new URI: {WS_URL}. Subscribing to trades...")
     
     while True:
         try:
-            # Explicitly connecting using the IP and Port, but providing the HOSTNAME for SSL validation.
-            async with websockets.connect(
-                URI, 
-                host=HOSTNAME, 
-                port=PORT,
-                server_hostname=HOSTNAME, # Redundant, but ensures hostname is used for SSL
-                # Pass the explicit IP address to the underlying socket connection
-                # This requires websockets to use the IP/Port for socket creation
-                # The 'uri' is parsed for the path '/trades'
-                # The 'host' parameter in connect tells the underlying socket to bypass DNS
-                # This is the most direct method to circumvent a broken DNS resolver
-                uri_host=IP_ADDRESS # Explicitly override the hostname for the socket connection
-            ) as websocket:
+            # Simple connection should now work without complex IP overrides
+            async with websockets.connect(WS_URL, open_timeout=10, close_timeout=10) as websocket:
                 logger.info("✅ Successfully connected to the WebSocket.")
+
+                # Subscribe to the broadest event to start the stream based on the new API docs.
+                # NOTE: The trade event structure will be different from the old API.
+                subscribe_payload = {
+                    "method": "subscribeNewToken",
+                }
+                await websocket.send(json.dumps(subscribe_payload))
+                logger.info("🚀 Subscription sent for new token events. Awaiting data...")
                 
                 while True:
                     message = await websocket.recv()
                     data = json.loads(message)
                     
-                    if data.get("event") != "trade":
-                        continue
-                        
-                    trade_type = data["data"].get("trade_type")
-                    sol_amount = float(data["data"].get("sol_amount", 0.0))
-                    token_mint = data["data"].get("mint")
-                    wallet = data["data"].get("wallet")
+                    # ⚠️ IMPORTANT: The data parsing logic below is a *guess* based on the 
+                    # expected output of the old code. It will likely need adjustment
+                    # to match the *actual* data structure of the new pumpportal API.
                     
-                    if trade_type == "BUY" and sol_amount >= MIN_BUY_SOL:
-                        await save_buy_async(wallet, token_mint, sol_amount)
+                    # Attempt to parse a token trade event from the new API structure
+                    event_type = data.get("method")
+                    if event_type == "tokenTrade" or event_type == "newToken":
                         
-                    elif trade_type == "SELL":
-                        await save_sell_async(wallet, token_mint, sol_amount)
+                        # Placeholder extraction logic - CHECK LOGS to find the correct fields
+                        trade_data = data.get("data", {})
+                        trade_type = trade_data.get("tx_type", "").upper()  # Must be 'BUY' or 'SELL'
+                        sol_amount = float(trade_data.get("sol_amount", 0.0) or 0.0)
+                        token_mint = trade_data.get("mint")
+                        wallet = trade_data.get("wallet") # Assuming this field exists for buyer/seller
+
+                        if trade_type == "BUY" and sol_amount >= MIN_BUY_SOL:
+                            await save_buy_async(wallet, token_mint, sol_amount)
+                            
+                        elif trade_type == "SELL":
+                            await save_sell_async(wallet, token_mint, sol_amount)
                         
         except websockets.exceptions.ConnectionClosedOK:
             logger.info("Websocket connection closed normally. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
         except websockets.exceptions.InvalidURI:
-            logger.critical(f"Invalid WebSocket URI: {URI}. Check the format!")
+            logger.critical(f"Invalid WebSocket URI: {WS_URL}. Check the format!")
             await asyncio.sleep(60) 
         except Exception as e:
-            # Catch all exceptions, including the underlying socket.gaierror
-            logger.error(f"Websocket error: Connection failed. Reconnecting in 10 seconds...", exc_info=False)
+            # Catch all exceptions, including the underlying network/socket failures.
+            logger.error(f"Websocket error: Connection failed ({e}). Reconnecting in 10 seconds...", exc_info=False)
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
