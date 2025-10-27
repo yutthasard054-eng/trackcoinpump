@@ -426,7 +426,7 @@ async def score_wallets_async():
             logger.error(f"Critical AI Scoring Error: {e}", exc_info=True)
             stats["errors"] += 1
 
-# === 6. WEBSOCKET LISTENER ===
+# === 6. WEBSOCKET LISTENER (ENHANCED WITH RAW LOGGING) ===
 
 open_trades_cache = {}
 
@@ -454,6 +454,10 @@ async def ws_listener():
                         stats["messages_received"] += 1
                         message_count += 1
                         
+                        # LOG FIRST 20 RAW MESSAGES
+                        if stats["messages_received"] <= 20:
+                            logger.info(f"RAW MESSAGE #{stats['messages_received']}: {message[:600]}")
+                        
                         current_time = time.time()
                         if current_time - last_sample_time > 10:
                             logger.info(f"Received {message_count} messages in last 10s")
@@ -463,15 +467,12 @@ async def ws_listener():
                         data = json.loads(message)
                         event_method = data.get("method")
                         trade_data = data.get("data", {})
-                        
-                        if stats["messages_received"] <= 3:
-                            logger.info(f"SAMPLE MESSAGE #{stats['messages_received']}: {json.dumps(data)[:300]}")
 
                         if event_method == "tokenTrade" and trade_data:
                             tx_type = trade_data.get("txType", "").lower()
                             sol_amount_str = trade_data.get("sol_amount")
                             
-                            if DEBUG_MODE and stats["messages_received"] % 50 == 0:
+                            if DEBUG_MODE and stats["buys_tracked"] < 5:
                                 logger.debug(f"Trade data: txType={tx_type}, sol_amount={sol_amount_str}")
                             
                             if sol_amount_str is None: 
@@ -487,7 +488,7 @@ async def ws_listener():
                             wallet = trade_data.get("user")
                             
                             if not token_mint or not wallet:
-                                if DEBUG_MODE:
+                                if DEBUG_MODE and stats["messages_received"] <= 50:
                                     logger.debug(f"Missing mint or wallet: mint={token_mint}, wallet={wallet}")
                                 continue
                             
@@ -542,11 +543,12 @@ async def ws_listener():
 if __name__ == "__main__":
     setup_logging()
     logger.info("="*60)
-    logger.info("SUPER AI AGENT STARTING (DEBUG MODE)")
+    logger.info("SUPER AI AGENT STARTING - ENHANCED DEBUG MODE")
     logger.info("="*60)
     logger.info(f"Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
     logger.info(f"Elite Threshold: {ELITE_THRESHOLD:.0%}")
     logger.info(f"Debug Mode: {DEBUG_MODE}")
+    logger.info(f"Will log first 20 RAW messages to diagnose data format")
     logger.info("="*60)
     
     try:
@@ -558,3 +560,24 @@ if __name__ == "__main__":
     finally:
         logger.info("Shutdown complete.")
         logger.info(f"Final Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']}")
+```
+
+---
+
+## ✅ **What This Version Does:**
+
+1. **Logs first 20 raw messages** - You'll see EXACTLY what data is coming through
+2. **Shows message format** - We can debug the structure
+3. **Reports statistics** - Every 10 seconds shows message count
+4. **Enhanced error logging** - Catches and logs all issues
+5. **Lower threshold (0.1 SOL)** - More trades detected
+
+---
+
+## 📊 **What You'll See:**
+
+Within 30 seconds:
+```
+RAW MESSAGE #1: {"method":"tokenTrade","data":{...}}
+RAW MESSAGE #2: {"signature":"abc123...","pool":"pump"...}
+RAW MESSAGE #3: ...
