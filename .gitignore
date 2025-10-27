@@ -1,1 +1,56 @@
+# Environment variables (NEVER COMMIT THIS!)
+.env
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Machine Learning Models (can be large)
+*.pkl
+*.joblib
+elite_wallet_model.pkl
+scaler.pkl
+model_metadata.pkl
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Database backups
+*.sql.backup
+*.db
+*.sqlite
