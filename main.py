@@ -6,7 +6,7 @@ import time
 import threading
 from supabase import create_client
 import logging
-import logging.handlers  # FIXED: Added missing import
+import logging.handlers
 import sys
 import queue
 import atexit
@@ -16,13 +16,12 @@ from datetime import datetime
 
 # === MACHINE LEARNING LIBRARIES ===
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier  # Better for small datasets
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import joblib 
 
 # === SUPABASE CONFIG (SECURE) ===
-# FIXED: Using environment variables for security
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pnvvnlcooykoqoebgfom.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
@@ -35,25 +34,23 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 MIN_BUY_SOL = 0.5   
 MIN_TRADES = 5      
 MIN_ROI = 3.0       
-ELITE_THRESHOLD = 0.90  # FIXED: Configurable threshold
-CHECK_INTERVAL_SEC = 1800  # 30 minutes
+ELITE_THRESHOLD = 0.90
+CHECK_INTERVAL_SEC = 1800
 TOKEN_INFO_URL = "https://frontend-api.pump.fun/trades/"
-TOKEN_DATA_URL = "https://frontend-api.pump.fun/coins/"  # NEW: For market cap
+TOKEN_DATA_URL = "https://frontend-api.pump.fun/coins/"
 MODEL_FILE = 'elite_wallet_model.pkl'
 SCALER_FILE = 'scaler.pkl'
 logger = logging.getLogger("PumpAI")
 
-# Use a ThreadPoolExecutor for all blocking I/O (DB & Requests)
 executor = ThreadPoolExecutor(max_workers=5) 
 
-# FIXED: Properly shutdown executor on exit
 def cleanup_executor():
     logger.info("Shutting down executor...")
     executor.shutdown(wait=True)
     
 atexit.register(cleanup_executor)
 
-# === 1. LOGGING SETUP (Non-Blocking) ===
+# === 1. LOGGING SETUP ===
 
 def setup_logging():
     log_queue = queue.Queue(-1)
@@ -85,56 +82,46 @@ def get_token_market_cap(token_mint):
         logger.warning(f"Failed to fetch market cap for {token_mint}: {e}")
         return 0
 
-# === 3. MACHINE LEARNING CORE (FIXED) ===
+# === 3. MACHINE LEARNING CORE ===
 
 def load_training_data():
     """Fetches and prepares data for ML training with improved logic."""
     try:
-        # FIXED: Bootstrap training by using ROI-based criteria for initial labeling
         resp = supabase.table("wallets").select(
             "address, tokens_traded, avg_hold_time_min, avg_pump_entry_mc, total_roi, wins, status"
         ).gte("tokens_traded", MIN_TRADES).execute()
         
         data = resp.data if resp.data else []
-        if len(data) < 10:  # Need minimum data for training
+        if len(data) < 10:
             logger.warning(f"AI Trainer: Insufficient data ({len(data)} wallets). Need at least 10.")
             return None, None, None
             
         df = pd.DataFrame(data)
         
-        # FIXED: Create labels using hybrid approach
-        # If status exists and is 'elite', use it
-        # Otherwise, bootstrap with criteria: high ROI, good win rate, enough trades
         def determine_label(row):
             if row['status'] == 'elite':
                 return 1
-            # Bootstrap logic for unlabeled data
             if row['tokens_traded'] >= MIN_TRADES and row['total_roi'] >= MIN_ROI * MIN_TRADES and row['wins'] >= 2:
                 return 1
             return 0
         
         df['is_elite'] = df.apply(determine_label, axis=1)
         
-        # Check if we have both classes
         if len(df['is_elite'].unique()) < 2:
             logger.warning("AI Trainer: Only one class present in training data.")
             return None, None, None
         
-        # Enhanced feature selection
         features = ['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc', 'total_roi', 'wins']
         
-        # Fill missing values
         for col in features:
             df[col] = df[col].fillna(0)
         
         X = df[features]
         y = df['is_elite']
         
-        # Log class distribution
         elite_count = sum(y)
         logger.info(f"🔍 Training data: {len(y)} wallets ({elite_count} elite, {len(y)-elite_count} non-elite)")
         
-        # Scaling features
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
         joblib.dump(scaler, SCALER_FILE) 
@@ -153,26 +140,22 @@ def train_model():
         
     logger.info("🧠 AI Trainer: Starting model training...")
     
-    # FIXED: Added model validation
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     
-    # Using RandomForest which generally works better with small datasets
     model = RandomForestClassifier(
         n_estimators=100,
         class_weight='balanced',
         random_state=42,
-        max_depth=5  # Prevent overfitting
+        max_depth=5
     )
     
     model.fit(X_train, y_train)
     
-    # Validate model
     train_accuracy = model.score(X_train, y_train)
     test_accuracy = model.score(X_test, y_test)
     
     logger.info(f"📊 Model Performance: Train={train_accuracy:.2%}, Test={test_accuracy:.2%}")
     
-    # Save model metadata
     model_metadata = {
         'features': features,
         'trained_at': datetime.now().isoformat(),
@@ -192,11 +175,9 @@ def predict_wallet_score(wallet_features):
         scaler = joblib.load(SCALER_FILE)
         metadata = joblib.load('model_metadata.pkl')
         
-        # Prepare features for prediction
         features_df = pd.DataFrame([wallet_features], columns=metadata['features'])
         features_scaled = scaler.transform(features_df)
         
-        # Predict probability of being the positive class (1, or 'elite')
         probability = model.predict_proba(features_scaled)[0][1]
         return probability
     except FileNotFoundError:
@@ -206,10 +187,10 @@ def predict_wallet_score(wallet_features):
         logger.error(f"AI Predictor Error: {e}", exc_info=True)
         return 0.0
 
-# === 4. DATABASE FUNCTIONS (Synchronous + Async Wrappers) ===
+# === 4. DATABASE FUNCTIONS ===
 
 def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
-    """FIXED: Now saves entry market cap."""
+    """Now saves entry market cap."""
     ts = int(time.time())
     try:
         supabase.table("trades").upsert({
@@ -217,7 +198,7 @@ def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
             "token_mint": token_mint, 
             "buy_sol": sol_amount,
             "buy_ts": ts, 
-            "entry_market_cap": market_cap,  # FIXED: Added market cap
+            "entry_market_cap": market_cap,
             "status": "open"
         }, on_conflict="wallet, token_mint, status").execute()
         
@@ -230,7 +211,7 @@ def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
         logger.info(f"🛒 Tracking Buy: {wallet[:8]}... | {sol_amount:.2f} SOL | MC: ${market_cap:,.0f}")
         return True
     except Exception as e:
-        if "23505" in str(e):  # Duplicate key error
+        if "23505" in str(e):
             return True
         logger.error(f"DB Error (save_buy): {e}", exc_info=True)
         return False
@@ -296,25 +277,22 @@ def _get_open_trade_sync(wallet, token_mint):
         logger.error(f"DB Error (get_open_trade): {e}", exc_info=True)
         return None
 
-# === 5. SCORING LOGIC (AI INTEGRATED & FIXED) ===
+# === 5. SCORING LOGIC ===
 
 async def score_wallets_async():
     """Main scoring loop with AI integration."""
-    # Initial model training when the scoring loop starts
     await asyncio.get_event_loop().run_in_executor(executor, train_model) 
     
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
         logger.info("🧠 AI Scoring: Starting scoring cycle...")
         
-        # Retrain the model periodically
         trained = await asyncio.get_event_loop().run_in_executor(executor, train_model)
         
         if not trained:
             logger.warning("⚠️ Model training skipped - insufficient data")
         
         try:
-            # 1. Check for Sells (Polling Mechanism - backup for websocket)
             open_trades = await get_open_trades_async()
             logger.info(f"📊 Checking {len(open_trades)} open trades for sells...")
             
@@ -340,7 +318,6 @@ async def score_wallets_async():
                 if sells:
                     await close_trade_in_db_async(wallet, mint, sells[-1]["sol_amount"], buy_sol)
             
-            # 2. Update Wallet Features and Score (AI Integration)
             wallets_resp = await asyncio.get_event_loop().run_in_executor(
                 executor, supabase.table("wallets").select("address").execute
             )
@@ -355,7 +332,6 @@ async def score_wallets_async():
                 tokens_traded = len(closed_trades)
                 
                 if tokens_traded >= MIN_TRADES:
-                    # Calculate features needed for the AI model
                     hold_times_sec = [
                         (t["sell_ts"] - t["buy_ts"]) 
                         for t in closed_trades 
@@ -374,7 +350,6 @@ async def score_wallets_async():
                     total_roi = sum(closed_rois)
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     
-                    # FIXED: Enhanced feature set
                     wallet_features = {
                         "tokens_traded": tokens_traded,
                         "avg_hold_time_min": avg_hold_time,
@@ -383,15 +358,12 @@ async def score_wallets_async():
                         "wins": wins
                     }
                     
-                    # AI PREDICTION STEP
                     elite_probability = await asyncio.get_event_loop().run_in_executor(
                         executor, predict_wallet_score, wallet_features
                     )
                     
-                    # Set status based on AI prediction threshold
                     status = "elite" if elite_probability >= ELITE_THRESHOLD else "evaluating"
                     
-                    # Update DB with features, probability, and status
                     update_data = {
                         "tokens_traded": tokens_traded, 
                         "wins": wins, 
@@ -412,7 +384,6 @@ async def score_wallets_async():
                         logger.info(f"⭐ Elite: {wallet[:8]}... | AI: {elite_probability:.2%}")
 
                 else:
-                    # Not enough data for AI scoring
                     await asyncio.get_event_loop().run_in_executor(
                         executor, 
                         supabase.table("wallets").update({
@@ -421,7 +392,6 @@ async def score_wallets_async():
                         }).eq("address", wallet).execute
                     )
 
-            # 3. Log Elite Wallets Summary
             elite_resp = await asyncio.get_event_loop().run_in_executor(
                 executor, 
                 supabase.table("wallets").select("address, elite_probability, total_roi, tokens_traded")
@@ -431,7 +401,7 @@ async def score_wallets_async():
             
             if elite:
                 logger.info(f"🌟 ELITE WALLETS: {len(elite)} found")
-                for w in elite[:5]:  # Show top 5
+                for w in elite[:5]:
                     logger.info(
                         f"  🏆 {w['address'][:12]}... | "
                         f"AI: {w.get('elite_probability', 0.0):.2%} | "
@@ -444,16 +414,14 @@ async def score_wallets_async():
         except Exception as e:
             logger.error(f"❌ Critical AI Scoring Error: {e}", exc_info=True)
 
-# === 6. WEBSOCKET LISTENER (FIXED & ENHANCED) ===
+# === 6. WEBSOCKET LISTENER ===
 
-# Track open trades in memory for fast lookup
 open_trades_cache = {}
 
 async def ws_listener():
     """Main websocket listener with sell detection."""
     uri = "wss://pumpportal.fun/api/data"
     
-    # Start the async scoring loop only once
     if not hasattr(ws_listener, 'scorer_started'):
         asyncio.create_task(score_wallets_async()) 
         ws_listener.scorer_started = True
@@ -463,7 +431,6 @@ async def ws_listener():
             async with websockets.connect(uri) as ws:
                 logger.info("✅ Connected to PumpPortal WebSocket")
                 
-                # Subscribe to trading events
                 await ws.send(json.dumps({"method": "subscribeNewToken"})) 
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []})) 
                 logger.info("🚀 Subscribed to token trades stream")
@@ -487,28 +454,23 @@ async def ws_listener():
                                 continue 
                                 
                             token_mint = trade_data.get("mint")
-                            wallet = trade_data.get("user")  # FIXED: Changed from 'wallet' to 'user'
+                            wallet = trade_data.get("user")
                             
                             if not token_mint or not wallet:
                                 continue
                             
-                            # FIXED: Process both buys AND sells from websocket
                             if tx_type == "buy" and sol_amount >= MIN_BUY_SOL:
-                                # Fetch market cap at entry
                                 market_cap = await asyncio.get_event_loop().run_in_executor(
                                     executor, get_token_market_cap, token_mint
                                 )
                                 
-                                # Track the buy
                                 success = await save_buy_async(wallet, token_mint, sol_amount, market_cap)
                                 
                                 if success:
-                                    # Cache for faster sell detection
                                     cache_key = f"{wallet}:{token_mint}"
                                     open_trades_cache[cache_key] = sol_amount
                                     
                             elif tx_type == "sell":
-                                # Check if we're tracking this trade
                                 cache_key = f"{wallet}:{token_mint}"
                                 
                                 if cache_key in open_trades_cache:
@@ -516,7 +478,6 @@ async def ws_listener():
                                     await close_trade_in_db_async(wallet, token_mint, sol_amount, buy_sol)
                                     del open_trades_cache[cache_key]
                                 else:
-                                    # Check database as backup
                                     open_trade = await asyncio.get_event_loop().run_in_executor(
                                         executor, _get_open_trade_sync, wallet, token_mint
                                     )
