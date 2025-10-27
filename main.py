@@ -1,678 +1,176 @@
 import asyncio
 import websockets
 import json
-import requests
 import time
-import threading
-from supabase import create_client
-import logging
-import logging.handlers
-import sys
-import queue
-import atexit
-from concurrent.futures import ThreadPoolExecutor
 import os
-from datetime import datetime
+import logging
 
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-import pandas as pd
-import joblib 
+# Simple logging setup
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("DEBUG")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pnvvnlcooykoqoebgfom.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-if not SUPABASE_KEY:
-    raise ValueError("SUPABASE_KEY environment variable is required!")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))
-MIN_TRADES = int(os.getenv("MIN_TRADES", "5"))
-MIN_ROI = float(os.getenv("MIN_ROI", "3.0"))
-ELITE_THRESHOLD = float(os.getenv("ELITE_THRESHOLD", "0.90"))
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "1800"))
-DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
-
-TOKEN_INFO_URL = "https://frontend-api.pump.fun/trades/"
-TOKEN_DATA_URL = "https://frontend-api.pump.fun/coins/"
-MODEL_FILE = 'elite_wallet_model.pkl'
-SCALER_FILE = 'scaler.pkl'
-logger = logging.getLogger("PumpAI")
-
-executor = ThreadPoolExecutor(max_workers=5) 
-
-stats = {
-    "messages_received": 0,
-    "buys_tracked": 0,
-    "sells_detected": 0,
-    "errors": 0,
-    "start_time": time.time(),
-    "field_samples": [],  # Store samples of actual fields we see
-    "trade_events": 0,    # Count actual trade events
-    "unknown_messages": 0 # Count messages we can't identify
+# Track what we receive
+message_stats = {
+    "total_messages": 0,
+    "connection_attempts": 0,
+    "last_message_time": None,
+    "message_types": {},
+    "sample_messages": []
 }
 
-def cleanup_executor():
-    logger.info("Shutting down executor...")
-    executor.shutdown(wait=True)
-    
-atexit.register(cleanup_executor)
-
-def setup_logging():
-    log_queue = queue.Queue(-1)
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    
-    queue_listener = logging.handlers.QueueListener(log_queue, console_handler)
-    queue_handler = logging.handlers.QueueHandler(log_queue)
-    root_logger.addHandler(queue_handler)
-    queue_listener.start()
-    atexit.register(queue_listener.stop)
-    logger.info("Non-blocking logging system initialized.")
-
-def debug_message_structure(data, message_num):
-    """Enhanced debug function to log message structure"""
-    if isinstance(data, dict):
-        logger.info(f"\n{'='*50}")
-        logger.info(f"MESSAGE #{message_num} STRUCTURE ANALYSIS")
-        logger.info(f"{'='*50}")
-        logger.info(f"Message type: {data.get('method', 'unknown')}")
-        logger.info(f"All top-level keys: {list(data.keys())}")
-        
-        # Check for nested data
-        if 'data' in data and isinstance(data['data'], dict):
-            logger.info(f"Nested data keys: {list(data['data'].keys())}")
-        
-        # Check for trade-related fields
-        trade_fields = ['txType', 'type', 'tx_type', 'traderPublicKey', 'user', 'wallet', 'mint', 'token', 'tokenMint', 'solAmount', 'sol_amount', 'sol', 'amount']
-        found_fields = {field: data.get(field) for field in trade_fields if data.get(field) is not None}
-        
-        if found_fields:
-            logger.info("Trade-related fields found:")
-            for field, value in found_fields.items():
-                if field in ['traderPublicKey', 'user', 'wallet', 'mint', 'token', 'tokenMint']:
-                    logger.info(f"  {field}: {str(value)[:12]}...")
-                else:
-                    logger.info(f"  {field}: {value}")
-        else:
-            logger.info("No trade-related fields detected")
-        
-        # Check if it's a trade event
-        if data.get('method') in ['tokenTrade', 'trade'] or 'txType' in data:
-            stats["trade_events"] += 1
-            logger.info(f"✓ TRADE EVENT DETECTED (Total: {stats['trade_events']})")
-        else:
-            stats["unknown_messages"] += 1
-            logger.info(f"? Unknown message type (Total unknown: {stats['unknown_messages']})")
-        
-        logger.info(f"{'='*50}\n")
-
-def get_token_market_cap(token_mint):
-    try:
-        resp = requests.get(f"{TOKEN_DATA_URL}{token_mint}", timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            market_cap = data.get("usd_market_cap", 0)
-            return market_cap
-        return 0
-    except Exception as e:
-        logger.warning(f"Failed to fetch market cap for {token_mint}: {e}")
-        return 0
-
-def load_training_data():
-    try:
-        resp = supabase.table("wallets").select(
-            "address, tokens_traded, avg_hold_time_min, avg_pump_entry_mc, total_roi, wins, status"
-        ).gte("tokens_traded", MIN_TRADES).execute()
-        
-        data = resp.data if resp.data else []
-        if len(data) < 10:
-            logger.warning(f"AI Trainer: Insufficient data ({len(data)} wallets). Need at least 10.")
-            return None, None, None
-            
-        df = pd.DataFrame(data)
-        
-        def determine_label(row):
-            if row['status'] == 'elite':
-                return 1
-            if row['tokens_traded'] >= MIN_TRADES and row['total_roi'] >= MIN_ROI * MIN_TRADES and row['wins'] >= 2:
-                return 1
-            return 0
-        
-        df['is_elite'] = df.apply(determine_label, axis=1)
-        
-        if len(df['is_elite'].unique()) < 2:
-            logger.warning("AI Trainer: Only one class present in training data.")
-            return None, None, None
-        
-        features = ['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc', 'total_roi', 'wins']
-        
-        for col in features:
-            df[col] = df[col].fillna(0)
-        
-        X = df[features]
-        y = df['is_elite']
-        
-        elite_count = sum(y)
-        logger.info(f"Training data: {len(y)} wallets ({elite_count} elite, {len(y)-elite_count} non-elite)")
-        
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        joblib.dump(scaler, SCALER_FILE) 
-        
-        return X_scaled, y, features
-    except Exception as e:
-        logger.error(f"AI Trainer Error (load_training_data): {e}", exc_info=True)
-        return None, None, None
-
-def train_model():
-    X, y, features = load_training_data()
-    if X is None or len(X) == 0:
-        logger.warning("AI Trainer: Cannot train - insufficient data.")
-        return False
-        
-    logger.info("AI Trainer: Starting model training...")
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    
-    model = RandomForestClassifier(
-        n_estimators=100,
-        class_weight='balanced',
-        random_state=42,
-        max_depth=5
-    )
-    
-    model.fit(X_train, y_train)
-    
-    train_accuracy = model.score(X_train, y_train)
-    test_accuracy = model.score(X_test, y_test)
-    
-    logger.info(f"Model Performance: Train={train_accuracy:.2%}, Test={test_accuracy:.2%}")
-    
-    model_metadata = {
-        'features': features,
-        'trained_at': datetime.now().isoformat(),
-        'train_accuracy': train_accuracy,
-        'test_accuracy': test_accuracy
-    }
-    
-    joblib.dump(model, MODEL_FILE)
-    joblib.dump(model_metadata, 'model_metadata.pkl')
-    logger.info(f"AI Trainer: Model saved to {MODEL_FILE}")
-    return True
-
-def predict_wallet_score(wallet_features):
-    try:
-        model = joblib.load(MODEL_FILE)
-        scaler = joblib.load(SCALER_FILE)
-        metadata = joblib.load('model_metadata.pkl')
-        
-        features_df = pd.DataFrame([wallet_features], columns=metadata['features'])
-        features_scaled = scaler.transform(features_df)
-        
-        probability = model.predict_proba(features_scaled)[0][1]
-        return probability
-    except FileNotFoundError:
-        logger.debug("Model not found - will train on next scoring cycle")
-        return 0.0 
-    except Exception as e:
-        logger.error(f"AI Predictor Error: {e}", exc_info=True)
-        return 0.0
-
-def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
-    ts = int(time.time())
-    try:
-        supabase.table("trades").upsert({
-            "wallet": wallet, 
-            "token_mint": token_mint, 
-            "buy_sol": sol_amount,
-            "buy_ts": ts, 
-            "entry_market_cap": market_cap,
-            "status": "open"
-        }, on_conflict="wallet, token_mint, status").execute()
-        
-        supabase.table("wallets").upsert({
-            "address": wallet, 
-            "first_seen": ts, 
-            "last_updated": ts
-        }, on_conflict="address").execute()
-        
-        logger.info(f"✓ BUY TRACKED: {wallet[:8]}... | {sol_amount:.2f} SOL | MC: ${market_cap:,.0f}")
-        stats["buys_tracked"] += 1
-        return True
-    except Exception as e:
-        if "23505" in str(e):
-            return True
-        logger.error(f"DB Error (save_buy): {e}", exc_info=True)
-        stats["errors"] += 1
-        return False
-
-async def save_buy_async(wallet, token_mint, sol_amount, market_cap):
-    return await asyncio.get_event_loop().run_in_executor(
-        executor, _save_buy_sync, wallet, token_mint, sol_amount, market_cap
-    )
-
-def _get_open_trades_sync():
-    try:
-        resp = supabase.table("trades").select(
-            "id, wallet, token_mint, buy_sol"
-        ).eq("status", "open").execute()
-        return resp.data if resp.data else []
-    except Exception as e:
-        logger.error(f"DB Error (get_open_trades): {e}", exc_info=True)
-        return []
-
-async def get_open_trades_async():
-    return await asyncio.get_event_loop().run_in_executor(executor, _get_open_trades_sync)
-
-def _close_trade_in_db_sync(wallet, token_mint, sell_sol, buy_sol):
-    roi = sell_sol / buy_sol if buy_sol > 0 else 0
-    try:
-        supabase.table("trades").update({
-            "sell_sol": sell_sol, 
-            "sell_ts": int(time.time()), 
-            "roi": roi, 
-            "status": "closed"
-        }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
-        
-        logger.info(f"✓ SELL CLOSED: {wallet[:8]}... | {token_mint[:8]}... | ROI: {roi:.2f}x")
-        stats["sells_detected"] += 1
-    except Exception as e:
-        logger.error(f"DB Error (close_trade): {e}", exc_info=True)
-        stats["errors"] += 1
-
-async def close_trade_in_db_async(wallet, token_mint, sell_sol, buy_sol):
-    await asyncio.get_event_loop().run_in_executor(
-        executor, _close_trade_in_db_sync, wallet, token_mint, sell_sol, buy_sol
-    )
-
-def _get_closed_trades_sync(wallet):
-    try:
-        resp = supabase.table("trades").select(
-            "roi, buy_ts, sell_ts, entry_market_cap"
-        ).eq("wallet", wallet).eq("status", "closed").execute()
-        return resp.data if resp.data else []
-    except Exception as e:
-        logger.error(f"DB Error (get_closed_trades): {e}", exc_info=True)
-        return []
-
-def _get_open_trade_sync(wallet, token_mint):
-    try:
-        resp = supabase.table("trades").select(
-            "id, buy_sol"
-        ).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
-        
-        if resp.data and len(resp.data) > 0:
-            return resp.data[0]
-        return None
-    except Exception as e:
-        logger.error(f"DB Error (get_open_trade): {e}", exc_info=True)
-        return None
-
-async def score_wallets_async():
-    await asyncio.get_event_loop().run_in_executor(executor, train_model) 
-    
-    while True:
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
-        logger.info("\n" + "="*60)
-        logger.info("AI SCORING CYCLE STARTING")
-        logger.info("="*60)
-        
-        uptime = time.time() - stats["start_time"]
-        logger.info(f"Stats Summary:")
-        logger.info(f"  Messages Received: {stats['messages_received']}")
-        logger.info(f"  Trade Events: {stats['trade_events']}")
-        logger.info(f"  Buys Tracked: {stats['buys_tracked']}")
-        logger.info(f"  Sells Detected: {stats['sells_detected']}")
-        logger.info(f"  Unknown Messages: {stats['unknown_messages']}")
-        logger.info(f"  Errors: {stats['errors']}")
-        logger.info(f"  Uptime: {uptime/3600:.1f} hours")
-        
-        trained = await asyncio.get_event_loop().run_in_executor(executor, train_model)
-        
-        if not trained:
-            logger.warning("Model training skipped - insufficient data")
-        
-        try:
-            open_trades = await get_open_trades_async()
-            logger.info(f"Checking {len(open_trades)} open trades for sells...")
-            
-            for trade in open_trades:
-                mint = trade["token_mint"]
-                wallet = trade["wallet"]
-                buy_sol = trade["buy_sol"]
-                
-                def check_sells():
-                    try:
-                        resp = requests.get(f"{TOKEN_INFO_URL}{mint}?limit=100", timeout=5)
-                        if resp.status_code != 200: 
-                            return []
-                        trades = resp.json()
-                        # Try both field name variants
-                        sells = [t for t in trades if t.get("txType") == "sell" and 
-                                (t.get("user") == wallet or t.get("traderPublicKey") == wallet)]
-                        return sells
-                    except Exception as e:
-                        logger.debug(f"Error checking sells for {mint}: {e}")
-                        return []
-                        
-                sells = await asyncio.get_event_loop().run_in_executor(executor, check_sells)
-                
-                if sells:
-                    # Try to get sol_amount with multiple field name possibilities
-                    sell_amount = (sells[-1].get("sol_amount") or 
-                                 sells[-1].get("solAmount") or 
-                                 sells[-1].get("sol") or 0)
-                    await close_trade_in_db_async(wallet, mint, sell_amount, buy_sol)
-            
-            wallets_resp = await asyncio.get_event_loop().run_in_executor(
-                executor, supabase.table("wallets").select("address").execute
-            )
-            wallets = [w["address"] for w in wallets_resp.data] if wallets_resp.data else []
-            
-            logger.info(f"Scoring {len(wallets)} wallets...")
-            
-            for wallet in wallets:
-                closed_trades = await asyncio.get_event_loop().run_in_executor(
-                    executor, _get_closed_trades_sync, wallet
-                )
-                tokens_traded = len(closed_trades)
-                
-                if tokens_traded >= MIN_TRADES:
-                    hold_times_sec = [
-                        (t["sell_ts"] - t["buy_ts"]) 
-                        for t in closed_trades 
-                        if t.get("sell_ts") and t.get("buy_ts")
-                    ]
-                    avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 if hold_times_sec else 0.0
-                    
-                    entry_mcs = [
-                        t["entry_market_cap"] 
-                        for t in closed_trades 
-                        if t.get("entry_market_cap") is not None
-                    ]
-                    avg_entry_mc = sum(entry_mcs) / len(entry_mcs) if entry_mcs else 0.0
-                    
-                    closed_rois = [t["roi"] for t in closed_trades]
-                    total_roi = sum(closed_rois)
-                    wins = len([r for r in closed_rois if r >= MIN_ROI])
-                    
-                    wallet_features = {
-                        "tokens_traded": tokens_traded,
-                        "avg_hold_time_min": avg_hold_time,
-                        "avg_pump_entry_mc": avg_entry_mc,
-                        "total_roi": total_roi,
-                        "wins": wins
-                    }
-                    
-                    elite_probability = await asyncio.get_event_loop().run_in_executor(
-                        executor, predict_wallet_score, wallet_features
-                    )
-                    
-                    status = "elite" if elite_probability >= ELITE_THRESHOLD else "evaluating"
-                    
-                    update_data = {
-                        "tokens_traded": tokens_traded, 
-                        "wins": wins, 
-                        "total_roi": total_roi,
-                        "avg_hold_time_min": avg_hold_time, 
-                        "avg_pump_entry_mc": avg_entry_mc,
-                        "status": status, 
-                        "elite_probability": elite_probability, 
-                        "last_updated": int(time.time())
-                    }
-                    
-                    await asyncio.get_event_loop().run_in_executor(
-                        executor, 
-                        supabase.table("wallets").update(update_data).eq("address", wallet).execute
-                    )
-                    
-                    if status == "elite":
-                        logger.info(f"🌟 ELITE FOUND: {wallet[:8]}... | AI: {elite_probability:.2%}")
-
-                else:
-                    await asyncio.get_event_loop().run_in_executor(
-                        executor, 
-                        supabase.table("wallets").update({
-                            "status": "candidate", 
-                            "last_updated": int(time.time())
-                        }).eq("address", wallet).execute
-                    )
-
-            elite_resp = await asyncio.get_event_loop().run_in_executor(
-                executor, 
-                supabase.table("wallets").select("address, elite_probability, total_roi, tokens_traded")
-                .eq("status", "elite").execute
-            )
-            elite = elite_resp.data if elite_resp.data else []
-            
-            if elite:
-                logger.info(f"\n🏆 ELITE WALLETS: {len(elite)} found")
-                for w in elite[:5]:
-                    logger.info(
-                        f"  ELITE: {w['address'][:12]}... | "
-                        f"AI: {w.get('elite_probability', 0.0):.2%} | "
-                        f"ROI: {w.get('total_roi', 0):.1f}x | "
-                        f"Trades: {w.get('tokens_traded', 0)}"
-                    )
-            else:
-                logger.info("\n📊 No elite wallets yet. Keep collecting data...")
-                
-        except Exception as e:
-            logger.error(f"Critical AI Scoring Error: {e}", exc_info=True)
-            stats["errors"] += 1
-
-open_trades_cache = {}
-
-def extract_trade_data(data):
-    """
-    Extract trade data with flexible field name handling.
-    PumpPortal API may use different field names - this tries multiple variants.
-    """
-    # The message might be wrapped or direct
-    if isinstance(data, dict):
-        # Check if it's wrapped in a "data" field
-        if "data" in data and isinstance(data["data"], dict):
-            trade_data = data["data"]
-        else:
-            trade_data = data
-            
-        # Extract fields with multiple possible names
-        tx_type = (trade_data.get("txType") or 
-                  trade_data.get("type") or 
-                  trade_data.get("tx_type") or "").lower()
-        
-        # Wallet address - try multiple field names
-        wallet = (trade_data.get("traderPublicKey") or 
-                 trade_data.get("user") or 
-                 trade_data.get("wallet") or 
-                 trade_data.get("trader"))
-        
-        # Token mint address
-        token_mint = (trade_data.get("mint") or 
-                     trade_data.get("token") or 
-                     trade_data.get("tokenMint"))
-        
-        # SOL amount - try multiple field names
-        sol_amount_raw = (trade_data.get("solAmount") or 
-                         trade_data.get("sol_amount") or 
-                         trade_data.get("sol") or 
-                         trade_data.get("amount"))
-        
-        # Convert to float if it exists
-        sol_amount = None
-        if sol_amount_raw is not None:
-            try:
-                sol_amount = float(sol_amount_raw)
-            except (ValueError, TypeError):
-                sol_amount = None
-                
-        return {
-            "tx_type": tx_type,
-            "wallet": wallet,
-            "token_mint": token_mint,
-            "sol_amount": sol_amount,
-            "raw_data": trade_data  # Keep raw data for debugging
-        }
-    
-    return None
-
-async def ws_listener():
-    # Updated WebSocket endpoint based on current API
+async def debug_websocket():
+    """Minimal WebSocket debugger to understand what's happening"""
     uri = "wss://pumpportal.fun/api/data"
     
-    if not hasattr(ws_listener, 'scorer_started'):
-        asyncio.create_task(score_wallets_async()) 
-        ws_listener.scorer_started = True
-
     while True:
         try:
+            message_stats["connection_attempts"] += 1
+            logger.info(f"🔌 Connection attempt #{message_stats['connection_attempts']}")
+            
             async with websockets.connect(uri) as ws:
-                logger.info("✅ Connected to PumpPortal WebSocket")
+                logger.info("✅ WebSocket connected successfully!")
                 
-                # Updated subscription methods based on current API
-                await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                await ws.send(json.dumps({"method": "subscribeTokenTrades"}))
-                logger.info("✅ Subscribed to token trades stream")
+                # Try different subscription methods
+                subscriptions = [
+                    {"method": "subscribeNewToken"},
+                    {"method": "subscribeTokenTrades"},
+                    {"method": "subscribeTokenTrade", "keys": []},
+                    {"method": "subscribeAllTrades"}
+                ]
                 
-                message_count = 0
-                last_sample_time = time.time()
-                last_status_update = time.time()
+                for sub in subscriptions:
+                    try:
+                        await ws.send(json.dumps(sub))
+                        logger.info(f"📤 Sent subscription: {sub}")
+                        await asyncio.sleep(0.5)  # Small delay between subscriptions
+                    except Exception as e:
+                        logger.error(f"❌ Failed to send {sub}: {e}")
                 
+                logger.info("⏳ Listening for messages...")
+                
+                # Listen for messages with detailed logging
                 async for message in ws:
                     try:
-                        stats["messages_received"] += 1
-                        message_count += 1
+                        message_stats["total_messages"] += 1
+                        message_stats["last_message_time"] = time.time()
                         
-                        # Enhanced debugging for first 50 messages
-                        if stats["messages_received"] <= 50:
-                            data = json.loads(message)
-                            debug_message_structure(data, stats["messages_received"])
-                        
-                        # Status update every 30 seconds
-                        current_time = time.time()
-                        if current_time - last_status_update > 30:
-                            logger.info(f"\n📊 STATUS UPDATE (Last 30s):")
-                            logger.info(f"  Messages: {message_count}")
-                            logger.info(f"  Trade Events: {stats['trade_events']}")
-                            logger.info(f"  Buys: {stats['buys_tracked']}")
-                            logger.info(f"  Sells: {stats['sells_detected']}")
-                            message_count = 0
-                            last_status_update = current_time
-                        
-                        # Parse message for trade processing
+                        # Parse the message
                         data = json.loads(message)
                         
-                        # Store sample of fields for first few messages
-                        if len(stats["field_samples"]) < 10 and isinstance(data, dict):
-                            stats["field_samples"].append(list(data.keys()))
-                        
-                        # Check if this is a trade event
-                        event_method = data.get("method")
-                        
-                        # Handle different message formats
-                        if event_method == "tokenTrade" or event_method == "trade" or "txType" in data:
-                            # Extract trade data with flexible field names
-                            trade_info = extract_trade_data(data)
+                        # Analyze message structure
+                        if isinstance(data, dict):
+                            msg_type = data.get('method', 'unknown')
+                            message_stats["message_types"][msg_type] = message_stats["message_types"].get(msg_type, 0) + 1
                             
-                            if not trade_info:
-                                continue
+                            # Log first 10 messages in detail
+                            if len(message_stats["sample_messages"]) < 10:
+                                message_stats["sample_messages"].append({
+                                    "num": message_stats["total_messages"],
+                                    "type": msg_type,
+                                    "keys": list(data.keys()),
+                                    "content": data
+                                })
                                 
-                            tx_type = trade_info["tx_type"]
-                            sol_amount = trade_info["sol_amount"]
-                            token_mint = trade_info["token_mint"]
-                            wallet = trade_info["wallet"]
-                            
-                            if DEBUG_MODE and stats["buys_tracked"] < 5:
-                                logger.debug(f"🔍 Extracted: txType={tx_type}, sol={sol_amount}, wallet={wallet[:8] if wallet else None}...")
-                            
-                            # Validate we have required fields
-                            if not token_mint or not wallet or sol_amount is None:
-                                if DEBUG_MODE and stats["messages_received"] <= 50:
-                                    logger.debug(f"⚠️ Missing required fields: mint={token_mint}, wallet={wallet}, sol={sol_amount}")
-                                continue
-                            
-                            if tx_type == "buy" and sol_amount >= MIN_BUY_SOL:
-                                logger.info(f"💰 BUY DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
+                                logger.info(f"\n{'='*60}")
+                                logger.info(f"📨 MESSAGE #{message_stats['total_messages']}")
+                                logger.info(f"Type: {msg_type}")
+                                logger.info(f"Keys: {list(data.keys())}")
                                 
-                                market_cap = await asyncio.get_event_loop().run_in_executor(
-                                    executor, get_token_market_cap, token_mint
-                                )
+                                # Check for trade-related content
+                                trade_indicators = ['txType', 'type', 'trader', 'user', 'wallet', 'mint', 'token', 'amount', 'sol']
+                                found_trade_fields = {k: v for k, v in data.items() if any(indicator in k.lower() for indicator in trade_indicators)}
                                 
-                                success = await save_buy_async(wallet, token_mint, sol_amount, market_cap)
-                                
-                                if success:
-                                    cache_key = f"{wallet}:{token_mint}"
-                                    open_trades_cache[cache_key] = sol_amount
-                                    
-                            elif tx_type == "sell":
-                                logger.info(f"💸 SELL DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
-                                cache_key = f"{wallet}:{token_mint}"
-                                
-                                if cache_key in open_trades_cache:
-                                    buy_sol = open_trades_cache[cache_key]
-                                    await close_trade_in_db_async(wallet, token_mint, sol_amount, buy_sol)
-                                    del open_trades_cache[cache_key]
+                                if found_trade_fields:
+                                    logger.info("🎯 TRADE-RELATED FIELDS FOUND:")
+                                    for k, v in found_trade_fields.items():
+                                        if isinstance(v, str) and len(v) > 20:
+                                            logger.info(f"  {k}: {v[:20]}...")
+                                        else:
+                                            logger.info(f"  {k}: {v}")
                                 else:
-                                    open_trade = await asyncio.get_event_loop().run_in_executor(
-                                        executor, _get_open_trade_sync, wallet, token_mint
-                                    )
-                                    
-                                    if open_trade:
-                                        await close_trade_in_db_async(
-                                            wallet, token_mint, sol_amount, open_trade["buy_sol"]
-                                        )
-                                        
-                    except json.JSONDecodeError:
-                        logger.warning(f"⚠️ Failed to decode message: {message[:100]}...")
-                        stats["errors"] += 1
-                    except Exception as e:
-                        logger.error(f"❌ Message Processing Error: {e}", exc_info=True)
-                        if DEBUG_MODE:
-                            logger.error(f"Problematic message: {message[:500]}")
-                        stats["errors"] += 1
+                                    logger.info("❌ No trade-related fields detected")
+                                
+                                logger.info(f"Full message: {json.dumps(data, indent=2)}")
+                                logger.info(f"{'='*60}\n")
                         
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("⚠️ WebSocket closed. Reconnecting in 5 seconds...")
+                        # Log summary every 50 messages
+                        if message_stats["total_messages"] % 50 == 0:
+                            logger.info(f"\n📊 SUMMARY (Received {message_stats['total_messages']} messages):")
+                            logger.info(f"  Message types: {message_stats['message_types']}")
+                            logger.info(f"  Last message: {time.strftime('%H:%M:%S', time.localtime(message_stats['last_message_time']))}")
+                            logger.info(f"  Rate: {message_stats['total_messages'] / (time.time() - start_time + 1):.1f} msg/sec\n")
+                    
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ JSON decode error: {e}")
+                        logger.error(f"Raw message: {message[:200]}...")
+                    except Exception as e:
+                        logger.error(f"❌ Message processing error: {e}")
+                        logger.error(f"Raw message: {message[:200]}...")
+                
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.error(f"🔌 WebSocket closed: {e}")
+            logger.info("⏳ Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"❌ WebSocket Connection Error: {e}. Reconnecting in 10 seconds...", exc_info=True)
-            stats["errors"] += 1
+            logger.error(f"❌ Connection error: {e}")
+            logger.info("⏳ Reconnecting in 10 seconds...")
             await asyncio.sleep(10)
 
-if __name__ == "__main__":
-    setup_logging()
-    logger.info("\n" + "="*60)
-    logger.info("🚀 SUPER AI AGENT STARTING - ENHANCED DEBUG MODE")
+async def monitor_activity():
+    """Monitor activity and report if we're not receiving messages"""
+    while True:
+        await asyncio.sleep(30)  # Check every 30 seconds
+        
+        if message_stats["last_message_time"]:
+            time_since_last = time.time() - message_stats["last_message_time"]
+            if time_since_last > 60:  # No messages for 1 minute
+                logger.warning(f"⚠️ No messages received for {time_since_last:.0f} seconds!")
+                logger.warning(f"Total messages so far: {message_stats['total_messages']}")
+                logger.warning(f"Message types: {message_stats['message_types']}")
+        else:
+            logger.warning("⚠️ No messages received yet!")
+
+async def main():
+    logger.info("🚀 Starting PumpPortal WebSocket Debugger")
     logger.info("="*60)
-    logger.info(f"⚙️ Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
-    logger.info(f"🎯 Elite Threshold: {ELITE_THRESHOLD:.0%}")
-    logger.info(f"🐛 Debug Mode: {DEBUG_MODE}")
-    logger.info("📋 Will analyze first 50 messages in detail")
-    logger.info("📊 Status updates every 30 seconds")
+    logger.info("This will show us exactly what messages we're receiving")
+    logger.info("and help us understand why trades aren't being detected.")
     logger.info("="*60)
     
+    global start_time
+    start_time = time.time()
+    
+    # Start both the WebSocket listener and activity monitor
+    await asyncio.gather(
+        debug_websocket(),
+        monitor_activity()
+    )
+
+if __name__ == "__main__":
     try:
-        asyncio.run(ws_listener())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\n⏹️ Agent stopped by user.")
-    except Exception as e:
-        logger.critical(f"💥 Fatal error: {e}", exc_info=True)
-    finally:
+        logger.info("\n🛑 Debugger stopped by user")
+        
+        # Final summary
         logger.info("\n" + "="*60)
-        logger.info("📊 FINAL STATISTICS")
+        logger.info("📊 FINAL DEBUG SUMMARY")
         logger.info("="*60)
-        logger.info(f"  Total Messages: {stats['messages_received']}")
-        logger.info(f"  Trade Events: {stats['trade_events']}")
-        logger.info(f"  Buys Tracked: {stats['buys_tracked']}")
-        logger.info(f"  Sells Detected: {stats['sells_detected']}")
-        logger.info(f"  Unknown Messages: {stats['unknown_messages']}")
-        logger.info(f"  Errors: {stats['errors']}")
-        if stats["field_samples"]:
-            logger.info(f"  Field samples: {stats['field_samples'][:5]}")
+        logger.info(f"Total messages received: {message_stats['total_messages']}")
+        logger.info(f"Connection attempts: {message_stats['connection_attempts']}")
+        logger.info(f"Message types: {message_stats['message_types']}")
+        
+        if message_stats["sample_messages"]:
+            logger.info("\n📋 Sample messages received:")
+            for i, sample in enumerate(message_stats["sample_messages"][:5]):
+                logger.info(f"\nSample #{i+1}:")
+                logger.info(f"  Type: {sample['type']}")
+                logger.info(f"  Keys: {sample['keys']}")
+                if any('trade' in str(sample['content']).lower() or 'tx' in str(sample['content']).lower() 
+                      for indicator in ['txType', 'type', 'trader', 'user', 'wallet', 'mint', 'token', 'amount', 'sol']):
+                    logger.info("  ⚠️ This message contains trade-related data!")
+        
         logger.info("="*60)
