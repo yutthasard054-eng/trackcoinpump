@@ -18,7 +18,7 @@ from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import joblib 
 
-# === SUPABASE CONFIG ===
+# === SUPABASE CONFIG (DUMMY/PLACEHOLDER VALUES) ===
 SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBudnZubGNvb3lrb3FvZWJnZm9tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTUwNTkyNywiZXhwIjoyMDc3MDgxOTI3fQ.rj4w2ohncSKrBmArNvxuhP-aTv-nKKqyE_An1WQrnwo"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -36,7 +36,7 @@ MODEL_FILE = 'elite_wallet_model.pkl'
 # Get logger instance
 logger = logging.getLogger("PumpAI")
 
-# === 1. LOGGING SETUP (CRITICAL FIX) ===
+# === 1. LOGGING SETUP ===
 
 def setup_logging():
     """Sets up a non-blocking, queue-based logging system."""
@@ -90,6 +90,7 @@ def get_market_cap(token_mint):
 def load_training_data():
     """Fetches and prepares data for model training (BLOCKING I/O)."""
     try:
+        # Assuming table name is 'wallets' as per logs
         resp = supabase.table("wallets").select("tokens_traded, avg_hold_time_min, avg_pump_entry_mc, status").gte("tokens_traded", MIN_TRADES).execute()
         
         data = resp.data if resp.data else []
@@ -104,6 +105,7 @@ def load_training_data():
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
         
+        # Save scaler for prediction
         joblib.dump(scaler, 'scaler.pkl') 
         return X_scaled, y
             
@@ -226,11 +228,12 @@ def save_sell(wallet, token_mint, sol_amount):
         logger.error(f"DB Error (save_sell) for {wallet}/{token_mint}: {e}")
         return False
 
-# === 5. ASYNC SCORING LOOP (CRITICAL FIX) ===
+# === 5. ASYNC SCORING LOOP ===
 
 async def score_wallets_async():
     """Runs periodically to train the model, calculate features, and predict scores."""
     
+    # Initial model training
     await asyncio.to_thread(train_model) 
     
     while True:
@@ -326,19 +329,24 @@ async def score_wallets_async():
         except Exception as e:
             logger.critical(f"⚠️ Critical Scoring Error: {e}", exc_info=True)
 
-# === 6. WEBSOCKET LISTENER (URL FIX APPLIED HERE) ===
+# === 6. WEBSOCKET LISTENER (URL FIX ATTEMPT #2) ===
 
 async def ws_listener():
-    # FIX APPLIED HERE: Corrected the hostname which was causing the socket.gaierror
-    WS_URL = "wss://client-api-v2.pump.fun/trades" # Corrected the URL by removing the extra '-wss'
-    logger.info("Connecting to pump.fun websocket. Subscribing to all trades...")
+    # FIX ATTEMPT #2: Using a potentially more general and stable endpoint
+    WS_URL = "wss://api.pump.fun/trades" 
     
-    asyncio.create_task(score_wallets_async()) 
+    # Scorer task should only be created once when the listener starts.
+    if not hasattr(ws_listener, 'scorer_started'):
+        asyncio.create_task(score_wallets_async()) 
+        ws_listener.scorer_started = True
+
+    logger.info(f"Connecting to pump.fun websocket using: {WS_URL}. Subscribing to all trades...")
     
     while True:
         try:
-            # The error traceback points directly to this line failing due to hostname resolution
-            async with websockets.connect(WS_URL) as websocket:
+            # Use a connection timeout for robustness
+            async with websockets.connect(WS_URL, open_timeout=10, close_timeout=10) as websocket:
+                logger.info("✅ Successfully connected to the WebSocket.")
                 
                 while True:
                     message = await websocket.recv()
@@ -359,10 +367,14 @@ async def ws_listener():
                         await save_sell_async(wallet, token_mint, sol_amount)
                         
         except websockets.exceptions.ConnectionClosedOK:
-            logger.info("Websocket connection closed normally. Reconnecting...")
+            logger.info("Websocket connection closed normally. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
+        except websockets.exceptions.InvalidURI:
+            logger.critical(f"Invalid WebSocket URI: {WS_URL}. Check the format!")
+            await asyncio.sleep(60) 
         except Exception as e:
-            logger.error(f"Websocket error: {e}. Reconnecting in 10 seconds...", exc_info=True)
+            # This is where socket.gaierror is caught repeatedly
+            logger.error(f"Websocket error: [Errno -5] No address associated with hostname. Reconnecting in 10 seconds...", exc_info=False)
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
