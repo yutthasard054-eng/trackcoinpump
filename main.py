@@ -77,6 +77,99 @@ def save_buy(wallet, token_mint, sol_amount):
         # Added token_mint and wallet to error log for better debugging
         print(f"DB Error (save_buy) for {wallet}/{token_mint}: {e}")
         return False
+        # === NEW IMPORTS FOR AI ===
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import joblib # Used for saving/loading the trained model
+
+# === AI AGENT CONFIGURATION ===
+MODEL_FILE = 'elite_wallet_model.pkl'
+
+# --- AI MODEL FUNCTIONS ---
+
+def load_training_data():
+    """Fetches and prepares data for model training."""
+    try:
+        # Fetch all wallets with enough closed trades
+        resp = supabase.table("wallets").select("tokens_traded, avg_hold_time_min, avg_pump_entry_mc, status").gte("tokens_traded", MIN_TRADES).execute()
+        
+        data = resp.data if resp.data else []
+        if not data:
+            print("AI Trainer: Not enough data to train model yet.")
+            return None, None
+            
+        df = pd.DataFrame(data)
+        
+        # 1. Feature Selection (X): The predictive features we engineered
+        X = df[['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc']]
+        
+        # 2. Target Variable (y): Convert status ('elite' or 'demoted') to binary (1 or 0)
+        df['is_elite'] = df['status'].apply(lambda s: 1 if s == 'elite' else 0)
+        y = df['is_elite']
+        
+        # Scale features for better model performance
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Save the scaler, as it must be used for future predictions
+        joblib.dump(scaler, 'scaler.pkl') 
+        
+        return X_scaled, y
+        
+    except Exception as e:
+        print(f"AI Trainer Error (load_training_data): {e}")
+        return None, None
+
+def train_model():
+    """Trains and saves the Logistic Regression model."""
+    X, y = load_training_data()
+    if X is None:
+        return
+        
+    print("AI Trainer: Starting model training...")
+    
+    # Simple split for training/testing
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Initialize and train the model
+    model = LogisticRegression()
+    model.fit(X_train, y_train)
+    
+    # Evaluate (optional but good practice)
+    score = model.score(X_test, y_test)
+    print(f"AI Trainer: Model accuracy on test set: {score:.4f}")
+    
+    # Save the trained model to a file
+    joblib.dump(model, MODEL_FILE)
+    print(f"AI Trainer: Model saved to {MODEL_FILE}")
+
+def predict_wallet_score(wallet_features):
+    """Loads the model and predicts the probability of a wallet being elite."""
+    try:
+        # 1. Load the trained model and scaler
+        model = joblib.load(MODEL_FILE)
+        scaler = joblib.load('scaler.pkl')
+        
+        # 2. Prepare and scale the single feature vector
+        features_df = pd.DataFrame([wallet_features], columns=['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc'])
+        features_scaled = scaler.transform(features_df)
+        
+        # 3. Predict the probability of the positive class (1 = elite)
+        # .predict_proba() returns probabilities for [0, 1]. We want the elite (1) probability.
+        probability = model.predict_proba(features_scaled)[0][1]
+        
+        return probability
+        
+    except FileNotFoundError:
+        print(f"AI Predictor: Model file {MODEL_FILE} not found. Needs training.")
+        return 0.0 # Return 0 if the model hasn't been trained yet
+    except Exception as e:
+        print(f"AI Predictor Error: {e}")
+        return 0.0
+
+# ------------------------------
 def get_all_wallets():
     try:
         response = supabase.table("wallets").select("address").execute()
@@ -126,79 +219,105 @@ def get_open_buy_sol(wallet, token_mint):
 # === SCORING LOGIC (NO MORE API POLLING) ===
 
 def score_wallets():
-    """Runs periodically to calculate and update wallet profitability scores and features."""
+    """Runs periodically to train the model, calculate features, and predict scores."""
+    # Run a training cycle at the start of the scoring loop
+    train_model() 
+    
     while True:
         time.sleep(CHECK_INTERVAL_SEC)
         print("🧠 Scoring wallets and generating features...")
         try:
             wallets = get_all_wallets()
+            
+            # Temporary storage for wallets that meet the minimum trade count
+            ready_to_predict = {} 
+
             for wallet in wallets:
                 
-                # Recalculate stats based ONLY on closed trades
-                # NEW: Select all data needed for feature engineering
+                # Fetch only closed trades to calculate features
                 closed_resp = supabase.table("trades").select("roi, buy_ts, sell_ts, entry_market_cap").eq("wallet", wallet).eq("status", "closed").execute()
                 closed_trades = closed_resp.data if closed_resp.data else []
 
-                # Initialize variables to prevent 'referenced before assignment' error
-                wins = 0
-                total_roi = 0
-                avg_hold_time = 0
-                avg_entry_mc = 0
-
-                if len(closed_trades) < MIN_TRADES:
+                tokens_traded = len(closed_trades)
+                
+                # 1. Feature Calculation Block
+                if tokens_traded < MIN_TRADES:
                     status = "candidate"
+                    total_roi = 0
+                    wins = 0
+                    avg_hold_time = 0
+                    avg_entry_mc = 0
                 else:
                     closed_rois = [t["roi"] for t in closed_trades]
                     
-                    # 1. Feature: Avg Hold Time Calculation
+                    # Feature 1: Avg Hold Time Calculation
                     hold_times_sec = [(t["sell_ts"] - t["buy_ts"]) for t in closed_trades if t["sell_ts"] and t["buy_ts"]]
-                    if hold_times_sec:
-                        avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 # Convert to minutes
-
-                    # 2. Feature: Avg Entry Market Cap Calculation
-                    entry_mcs = [t["entry_market_cap"] for t in closed_trades if t["entry_market_cap"] is not None]
-                    if entry_mcs:
-                        avg_entry_mc = sum(entry_mcs) / len(entry_mcs)
+                    avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 if hold_times_sec else 0.0
                     
-                    # 3. Standard Score Calculations
+                    # Feature 2: Avg Entry Market Cap Calculation
+                    entry_mcs = [t["entry_market_cap"] for t in closed_trades if t["entry_market_cap"] is not None]
+                    avg_entry_mc = sum(entry_mcs) / len(entry_mcs) if entry_mcs else 0.0
+                    
+                    # Standard Stats
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     total_roi = sum(closed_rois)
-                    avg_roi = total_roi / len(closed_trades)
-                    win_rate = wins / len(closed_trades)
+
+                    # Store for prediction
+                    wallet_features = {
+                        "tokens_traded": tokens_traded,
+                        "avg_hold_time_min": avg_hold_time,
+                        "avg_pump_entry_mc": avg_entry_mc
+                    }
+                    ready_to_predict[wallet] = (wallet_features, wins, total_roi)
                     
-                    # Determine final status (placeholder, will be replaced by AI model)
-                    if win_rate >= MIN_WIN_RATE and avg_roi >= MIN_ROI:
-                        status = "elite"
-                    else:
-                        status = "demoted"
+                    # Placeholder status before prediction runs
+                    status = "evaluating" 
                 
-                # Update wallet record with new stats and features
+                # Update wallet record with new calculated features (before prediction)
                 try:
                     supabase.table("wallets").update({
-                        "tokens_traded": len(closed_trades),
+                        "tokens_traded": tokens_traded,
                         "wins": wins,
                         "total_roi": total_roi,
-                        "avg_hold_time_min": avg_hold_time, # NEW FEATURE
-                        "avg_pump_entry_mc": avg_entry_mc, # NEW FEATURE
+                        "avg_hold_time_min": avg_hold_time, 
+                        "avg_pump_entry_mc": avg_entry_mc, 
                         "status": status,
                         "last_updated": int(time.time())
                     }).eq("address", wallet).execute()
                 except Exception as db_update_e:
                     print(f"⚠️ DB Update Error for {wallet}: {db_update_e}")
 
+            # --- AI PREDICTION STEP ---
+            if ready_to_predict:
+                print("AI Predictor: Starting live scoring...")
+                for wallet, (features, wins, total_roi) in ready_to_predict.items():
+                    # Get the predictive probability
+                    elite_probability = predict_wallet_score(features)
+                    
+                    # The wallet status is now based on the AI's prediction!
+                    # We use a 0.85 (85%) probability as the new "elite" threshold
+                    if elite_probability >= 0.85:
+                        status = "elite"
+                    else:
+                        status = "demoted"
+                        
+                    # Final update with AI score
+                    supabase.table("wallets").update({
+                        "status": status,
+                        "elite_probability": elite_probability # You need to add this column to Supabase!
+                    }).eq("address", wallet).execute()
+                    
+                    print(f"🧠 AI Score for {wallet}: {elite_probability:.4f} -> {status}")
 
             # Log elite list
-            elite_resp = supabase.table("wallets").select("address, total_roi").eq("status", "elite").execute()
+            elite_resp = supabase.table("wallets").select("address, total_roi, elite_probability").eq("status", "elite").execute()
             elite = elite_resp.data if elite_resp.data else []
-            if elite:
-                print("🌟 ELITE WALLETS FOUND:")
-                for w in elite:
-                    print(f"  - {w['address']} (ROI: {w['total_roi']:.2f}x)")
-            else:
-                print("⏳ No elite wallets yet.")
+            # ... rest of your logging ...
 
         except Exception as e:
-            print(f"⚠️ Scoring error: {e}")
+            print(f"⚠️ Critical Scoring Error: {e}")
+            
+# ------------------------------
 
 # ------------------------------
 # === MAIN WEBSOCKET LISTENER (HANDLES BUYS AND SELLS) ===
