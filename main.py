@@ -313,6 +313,8 @@ def score_wallets():
                 avg_roi = sum(closed_rois) / len(closed_rois) if closed_rois else 0
                 win_rate = wins / len(closed_rois) if closed_rois else 0
                 
+                elite_probability = 0.0
+                
                 if len(closed_trades) >= MIN_TRADES:
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     avg_roi = sum(closed_rois) / len(closed_rois) if closed_rois else 0
