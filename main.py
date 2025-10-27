@@ -26,17 +26,17 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pnvvnlcooykoqoebgfom.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 if not SUPABASE_KEY:
-    raise ValueError("❌ SUPABASE_KEY environment variable is required!")
+    raise ValueError("SUPABASE_KEY environment variable is required!")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # === CONFIG & ML SETUP ===
-MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))  # LOWERED from 0.5 to 0.1
+MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))
 MIN_TRADES = int(os.getenv("MIN_TRADES", "5"))
 MIN_ROI = float(os.getenv("MIN_ROI", "3.0"))
 ELITE_THRESHOLD = float(os.getenv("ELITE_THRESHOLD", "0.90"))
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "1800"))
-DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"  # NEW: Debug mode
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 
 TOKEN_INFO_URL = "https://frontend-api.pump.fun/trades/"
 TOKEN_DATA_URL = "https://frontend-api.pump.fun/coins/"
@@ -66,7 +66,7 @@ atexit.register(cleanup_executor)
 def setup_logging():
     log_queue = queue.Queue(-1)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)  # Debug level
+    root_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
@@ -76,12 +76,11 @@ def setup_logging():
     root_logger.addHandler(queue_handler)
     queue_listener.start()
     atexit.register(queue_listener.stop)
-    logger.info("✅ Non-blocking logging system initialized.")
+    logger.info("Non-blocking logging system initialized.")
 
 # === 2. MARKET CAP FETCHING ===
 
 def get_token_market_cap(token_mint):
-    """Fetches current market cap for a token from pump.fun API."""
     try:
         resp = requests.get(f"{TOKEN_DATA_URL}{token_mint}", timeout=5)
         if resp.status_code == 200:
@@ -96,7 +95,6 @@ def get_token_market_cap(token_mint):
 # === 3. MACHINE LEARNING CORE ===
 
 def load_training_data():
-    """Fetches and prepares data for ML training with improved logic."""
     try:
         resp = supabase.table("wallets").select(
             "address, tokens_traded, avg_hold_time_min, avg_pump_entry_mc, total_roi, wins, status"
@@ -131,7 +129,7 @@ def load_training_data():
         y = df['is_elite']
         
         elite_count = sum(y)
-        logger.info(f"🔍 Training data: {len(y)} wallets ({elite_count} elite, {len(y)-elite_count} non-elite)")
+        logger.info(f"Training data: {len(y)} wallets ({elite_count} elite, {len(y)-elite_count} non-elite)")
         
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
@@ -143,13 +141,12 @@ def load_training_data():
         return None, None, None
 
 def train_model():
-    """Trains and saves the RandomForest model with validation."""
     X, y, features = load_training_data()
     if X is None or len(X) == 0:
         logger.warning("AI Trainer: Cannot train - insufficient data.")
         return False
         
-    logger.info("🧠 AI Trainer: Starting model training...")
+    logger.info("AI Trainer: Starting model training...")
     
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     
@@ -165,7 +162,7 @@ def train_model():
     train_accuracy = model.score(X_train, y_train)
     test_accuracy = model.score(X_test, y_test)
     
-    logger.info(f"📊 Model Performance: Train={train_accuracy:.2%}, Test={test_accuracy:.2%}")
+    logger.info(f"Model Performance: Train={train_accuracy:.2%}, Test={test_accuracy:.2%}")
     
     model_metadata = {
         'features': features,
@@ -176,11 +173,10 @@ def train_model():
     
     joblib.dump(model, MODEL_FILE)
     joblib.dump(model_metadata, 'model_metadata.pkl')
-    logger.info(f"✅ AI Trainer: Model saved to {MODEL_FILE}")
+    logger.info(f"AI Trainer: Model saved to {MODEL_FILE}")
     return True
 
 def predict_wallet_score(wallet_features):
-    """Predicts the probability of a wallet being 'elite'."""
     try:
         model = joblib.load(MODEL_FILE)
         scaler = joblib.load(SCALER_FILE)
@@ -201,7 +197,6 @@ def predict_wallet_score(wallet_features):
 # === 4. DATABASE FUNCTIONS ===
 
 def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
-    """Now saves entry market cap."""
     ts = int(time.time())
     try:
         supabase.table("trades").upsert({
@@ -219,7 +214,7 @@ def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
             "last_updated": ts
         }, on_conflict="address").execute()
         
-        logger.info(f"🛒 Tracking Buy: {wallet[:8]}... | {sol_amount:.2f} SOL | MC: ${market_cap:,.0f}")
+        logger.info(f"BUY TRACKED: {wallet[:8]}... | {sol_amount:.2f} SOL | MC: ${market_cap:,.0f}")
         stats["buys_tracked"] += 1
         return True
     except Exception as e:
@@ -257,7 +252,7 @@ def _close_trade_in_db_sync(wallet, token_mint, sell_sol, buy_sol):
             "status": "closed"
         }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
         
-        logger.info(f"💰 Closed: {wallet[:8]}... | {token_mint[:8]}... | ROI: {roi:.2f}x")
+        logger.info(f"SELL CLOSED: {wallet[:8]}... | {token_mint[:8]}... | ROI: {roi:.2f}x")
         stats["sells_detected"] += 1
     except Exception as e:
         logger.error(f"DB Error (close_trade): {e}", exc_info=True)
@@ -279,7 +274,6 @@ def _get_closed_trades_sync(wallet):
         return []
 
 def _get_open_trade_sync(wallet, token_mint):
-    """Get a specific open trade."""
     try:
         resp = supabase.table("trades").select(
             "id, buy_sol"
@@ -295,25 +289,23 @@ def _get_open_trade_sync(wallet, token_mint):
 # === 5. SCORING LOGIC ===
 
 async def score_wallets_async():
-    """Main scoring loop with AI integration."""
     await asyncio.get_event_loop().run_in_executor(executor, train_model) 
     
     while True:
         await asyncio.sleep(CHECK_INTERVAL_SEC)
-        logger.info("🧠 AI Scoring: Starting scoring cycle...")
+        logger.info("AI Scoring: Starting scoring cycle...")
         
-        # Print stats
         uptime = time.time() - stats["start_time"]
-        logger.info(f"📊 Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']} | Uptime={uptime/3600:.1f}h")
+        logger.info(f"Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']} | Uptime={uptime/3600:.1f}h")
         
         trained = await asyncio.get_event_loop().run_in_executor(executor, train_model)
         
         if not trained:
-            logger.warning("⚠️ Model training skipped - insufficient data")
+            logger.warning("Model training skipped - insufficient data")
         
         try:
             open_trades = await get_open_trades_async()
-            logger.info(f"📊 Checking {len(open_trades)} open trades for sells...")
+            logger.info(f"Checking {len(open_trades)} open trades for sells...")
             
             for trade in open_trades:
                 mint = trade["token_mint"]
@@ -342,7 +334,7 @@ async def score_wallets_async():
             )
             wallets = [w["address"] for w in wallets_resp.data] if wallets_resp.data else []
             
-            logger.info(f"📊 Scoring {len(wallets)} wallets...")
+            logger.info(f"Scoring {len(wallets)} wallets...")
             
             for wallet in wallets:
                 closed_trades = await asyncio.get_event_loop().run_in_executor(
@@ -400,7 +392,7 @@ async def score_wallets_async():
                     )
                     
                     if status == "elite":
-                        logger.info(f"⭐ Elite: {wallet[:8]}... | AI: {elite_probability:.2%}")
+                        logger.info(f"ELITE FOUND: {wallet[:8]}... | AI: {elite_probability:.2%}")
 
                 else:
                     await asyncio.get_event_loop().run_in_executor(
@@ -419,27 +411,26 @@ async def score_wallets_async():
             elite = elite_resp.data if elite_resp.data else []
             
             if elite:
-                logger.info(f"🌟 ELITE WALLETS: {len(elite)} found")
+                logger.info(f"ELITE WALLETS: {len(elite)} found")
                 for w in elite[:5]:
                     logger.info(
-                        f"  🏆 {w['address'][:12]}... | "
+                        f"  ELITE: {w['address'][:12]}... | "
                         f"AI: {w.get('elite_probability', 0.0):.2%} | "
                         f"ROI: {w.get('total_roi', 0):.1f}x | "
                         f"Trades: {w.get('tokens_traded', 0)}"
                     )
             else:
-                logger.info("⏳ No elite wallets yet. Keep collecting data...")
+                logger.info("No elite wallets yet. Keep collecting data...")
                 
         except Exception as e:
-            logger.error(f"❌ Critical AI Scoring Error: {e}", exc_info=True)
+            logger.error(f"Critical AI Scoring Error: {e}", exc_info=True)
             stats["errors"] += 1
 
-# === 6. WEBSOCKET LISTENER (ENHANCED WITH DEBUG) ===
+# === 6. WEBSOCKET LISTENER ===
 
 open_trades_cache = {}
 
 async def ws_listener():
-    """Main websocket listener with enhanced debugging."""
     uri = "wss://pumpportal.fun/api/data"
     
     if not hasattr(ws_listener, 'scorer_started'):
@@ -449,11 +440,11 @@ async def ws_listener():
     while True:
         try:
             async with websockets.connect(uri) as ws:
-                logger.info("✅ Connected to PumpPortal WebSocket")
+                logger.info("Connected to PumpPortal WebSocket")
                 
                 await ws.send(json.dumps({"method": "subscribeNewToken"})) 
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": []})) 
-                logger.info("🚀 Subscribed to token trades stream")
+                logger.info("Subscribed to token trades stream")
                 
                 message_count = 0
                 last_sample_time = time.time()
@@ -463,10 +454,9 @@ async def ws_listener():
                         stats["messages_received"] += 1
                         message_count += 1
                         
-                        # Log sample message every 10 seconds
                         current_time = time.time()
                         if current_time - last_sample_time > 10:
-                            logger.info(f"📡 Received {message_count} messages in last 10s")
+                            logger.info(f"Received {message_count} messages in last 10s")
                             message_count = 0
                             last_sample_time = current_time
                         
@@ -474,17 +464,15 @@ async def ws_listener():
                         event_method = data.get("method")
                         trade_data = data.get("data", {})
                         
-                        # DEBUG: Log first few messages to see structure
                         if stats["messages_received"] <= 3:
-                            logger.info(f"🔍 SAMPLE MESSAGE #{stats['messages_received']}: {json.dumps(data)[:300]}")
+                            logger.info(f"SAMPLE MESSAGE #{stats['messages_received']}: {json.dumps(data)[:300]}")
 
                         if event_method == "tokenTrade" and trade_data:
                             tx_type = trade_data.get("txType", "").lower()
                             sol_amount_str = trade_data.get("sol_amount")
                             
-                            # DEBUG: Log what we're seeing
                             if DEBUG_MODE and stats["messages_received"] % 50 == 0:
-                                logger.debug(f"🔍 Trade data: txType={tx_type}, sol_amount={sol_amount_str}")
+                                logger.debug(f"Trade data: txType={tx_type}, sol_amount={sol_amount_str}")
                             
                             if sol_amount_str is None: 
                                 continue
@@ -492,7 +480,7 @@ async def ws_listener():
                             try:
                                 sol_amount = float(sol_amount_str)
                             except (ValueError, TypeError):
-                                logger.warning(f"⚠️ Invalid SOL amount: {sol_amount_str}")
+                                logger.warning(f"Invalid SOL amount: {sol_amount_str}")
                                 continue 
                                 
                             token_mint = trade_data.get("mint")
@@ -500,11 +488,11 @@ async def ws_listener():
                             
                             if not token_mint or not wallet:
                                 if DEBUG_MODE:
-                                    logger.debug(f"⚠️ Missing mint or wallet: mint={token_mint}, wallet={wallet}")
+                                    logger.debug(f"Missing mint or wallet: mint={token_mint}, wallet={wallet}")
                                 continue
                             
                             if tx_type == "buy" and sol_amount >= MIN_BUY_SOL:
-                                logger.info(f"🎯 BUY DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
+                                logger.info(f"BUY DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
                                 
                                 market_cap = await asyncio.get_event_loop().run_in_executor(
                                     executor, get_token_market_cap, token_mint
@@ -517,7 +505,7 @@ async def ws_listener():
                                     open_trades_cache[cache_key] = sol_amount
                                     
                             elif tx_type == "sell":
-                                logger.info(f"💸 SELL DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
+                                logger.info(f"SELL DETECTED: {wallet[:8]}... | {sol_amount:.2f} SOL | Token: {token_mint[:8]}...")
                                 cache_key = f"{wallet}:{token_mint}"
                                 
                                 if cache_key in open_trades_cache:
@@ -542,10 +530,10 @@ async def ws_listener():
                         stats["errors"] += 1
                         
         except websockets.exceptions.ConnectionClosed:
-            logger.warning("⚠️ Websocket closed. Reconnecting in 5 seconds...")
+            logger.warning("Websocket closed. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"❌ WebSocket Connection Error: {e}. Reconnecting in 10 seconds...", exc_info=True)
+            logger.error(f"WebSocket Connection Error: {e}. Reconnecting in 10 seconds...", exc_info=True)
             stats["errors"] += 1
             await asyncio.sleep(10)
 
@@ -554,61 +542,19 @@ async def ws_listener():
 if __name__ == "__main__":
     setup_logging()
     logger.info("="*60)
-    logger.info("🤖 SUPER AI AGENT STARTING (DEBUG MODE)")
+    logger.info("SUPER AI AGENT STARTING (DEBUG MODE)")
     logger.info("="*60)
-    logger.info(f"📊 Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
-    logger.info(f"🎯 Elite Threshold: {ELITE_THRESHOLD:.0%}")
-    logger.info(f"🐛 Debug Mode: {DEBUG_MODE}")
+    logger.info(f"Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
+    logger.info(f"Elite Threshold: {ELITE_THRESHOLD:.0%}")
+    logger.info(f"Debug Mode: {DEBUG_MODE}")
     logger.info("="*60)
     
     try:
         asyncio.run(ws_listener())
     except KeyboardInterrupt:
-        logger.info("🛑 Agent stopped by user.")
+        logger.info("Agent stopped by user.")
     except Exception as e:
-        logger.critical(f"💥 Fatal error: {e}", exc_info=True)
+        logger.critical(f"Fatal error: {e}", exc_info=True)
     finally:
-        logger.info("👋 Shutdown complete.")
-        logger.info(f"📊 Final Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']}")
-```
-
----
-
-## 🎯 **What's New in This Version:**
-
-### ✅ **1. Lowered Threshold**
-- **MIN_BUY_SOL = 0.1** (was 0.5)
-- Will catch WAY more trades
-
-### ✅ **2. Enhanced Debug Logging**
-- Shows first 3 messages received
-- Logs sample messages every 10 seconds
-- Shows BUY/SELL detections with details
-- Tracks statistics (messages, buys, sells, errors)
-
-### ✅ **3. Stats Tracking**
-```
-📊 Stats: Messages=1250 | Buys=45 | Sells=12 | Errors=0 | Uptime=1.5h
-```
-
-### ✅ **4. Better Error Handling**
-- All errors logged with stack traces
-- Error counter tracks issues
-- More descriptive warnings
-
-### ✅ **5. Message Flow Visibility**
-```
-📡 Received 87 messages in last 10s
-🎯 BUY DETECTED: abc123... | 0.15 SOL | Token: xyz789...
-🛒 Tracking Buy: abc123... | 0.15 SOL | MC: $12,500
-```
-
-### ✅ **6. Environment Variable Support**
-Can customize everything via Railway variables:
-```
-MIN_BUY_SOL=0.1
-MIN_TRADES=5
-MIN_ROI=3.0
-ELITE_THRESHOLD=0.90
-DEBUG_MODE=true
-```
+        logger.info("Shutdown complete.")
+        logger.info(f"Final Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']}")
