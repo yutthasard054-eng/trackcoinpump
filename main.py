@@ -83,7 +83,7 @@ def score_wallets():
                 if not open_trades.data:
                     continue
 
-                for trade in open_trades.
+                for trade in open_trades.data:
                     mint = trade["token_mint"]
                     buy_sol = trade["buy_sol"]
                     api_trades = get_trades_from_api(mint)
