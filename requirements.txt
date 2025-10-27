@@ -1,4 +1,5 @@
 websockets==13.1
 requests==2.32.3
 supabase==2.7.0
-scikit-learn==1.5.0
+pandas               <-- ADD THIS LINE
+scikit-learn         <-- ADD THIS LINE
