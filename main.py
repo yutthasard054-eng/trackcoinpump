@@ -11,7 +11,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 # === CONFIG ===
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pnvvnlcooykoqoebgfom.supabase.co")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://remove-this-and-use-your-own-url.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 
@@ -24,7 +24,7 @@ MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))
 MIN_TRADES = int(os.getenv("MIN_TRADES", "5"))
 MIN_ROI = float(os.getenv("MIN_ROI", "3.0"))
 ELITE_THRESHOLD = float(os.getenv("ELITE_THRESHOLD", "0.90"))
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))  # 3 minutes
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180")
 
 # Helius RPC endpoint
 HELIUS_RPC_URL = f"https://rpc.helius.xyz/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else "https://api.mainnet-beta.solana.com"
@@ -34,20 +34,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 executor = ThreadPoolExecutor(max_workers=5)
 
 # === DATABASE FUNCTIONS ===
-def save_buy(wallet, token_mint, sol_amount, market_cap=0, signature=None):
+def save_buy(wallet, token_mint, sol_amount, market_cap=0):
     ts = int(time.time())
     try:
-        data = {
+        supabase.table("trades").upsert({
             "wallet": wallet, 
             "token_mint": token_mint, 
             "buy_sol": sol_amount,
             "buy_ts": ts, 
             "entry_market_cap": market_cap,
             "status": "open"
-        }
-        if signature:
-            data["signature"] = signature
-        supabase.table("trades").upsert(data, on_conflict="wallet, token_mint, status").execute()
+        }, on_conflict="wallet, token_mint, status").execute()
         supabase.table("wallets").upsert({
             "address": wallet, "first_seen": ts, "last_updated": ts
         }).execute()
@@ -58,18 +55,15 @@ def save_buy(wallet, token_mint, sol_amount, market_cap=0, signature=None):
         logger.error(f"DB Error (save_buy): {e}")
         return False
 
-def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol, signature=None):
+def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol):
     roi = sell_sol / buy_sol if buy_sol > 0 else 0
     try:
-        data = {
+        supabase.table("trades").update({
             "sell_sol": sell_sol, 
             "sell_ts": int(time.time()), 
             "roi": roi, 
             "status": "closed"
-        }
-        if signature:
-            data["sell_signature"] = signature
-        supabase.table("trades").update(data).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
+        }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
         logger.info(f"💰 SELL: {wallet[:12]}... | {token_mint[:12]}... | ROI: {roi:.2f}x")
         return True
     except Exception as e:
@@ -78,7 +72,7 @@ def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol, signature=None):
 
 def get_open_trades():
     try:
-        resp = supabase.table("trades").select("id, wallet, token_mint, buy_sol, buy_ts, signature").eq("status", "open").execute()
+        resp = supabase.table("trades").select("id, wallet, token_mint, buy_sol, buy_ts").eq("status", "open").execute()
         return resp.data if resp.data else []
     except Exception as e:
         logger.error(f"DB Error (get_open_trades): {e}")
@@ -136,7 +130,7 @@ def parse_pump_transaction(signature):
                         
                         # Extract swap details
                         input_a = swap_info.get('inputA', '')
-                        input_b = swap_info.get('inputB', '')
+                        input_b = swap_info.get('outputB', '')
                         output_a = swap_info.get('outputA', '')
                         output_b = swap_info.get('outputB', '')
                         
@@ -149,35 +143,20 @@ def parse_pump_transaction(signature):
                                 'type': 'buy',
                                 'token_mint': token_mint,
                                 'sol_amount': sol_amount,
-                                'user': tx['transaction']['message']['accountKeys'][0],
-                                'signature': signature
+                                'user': tx['transaction']['message']['accountKeys'][0]
                             }
                         elif 'So111111111' in output_a and 'So111111111' not in input_b:
                             # Token in, SOL out = SELL
                             token_mint = input_a.split(' ')[0] if ' ' in input_a else input_a
-                            sol_amount = float(output_a.replace('So111111111', ''))
+                            sol_amount = float(output_a.replace('Sol111111111', ''))
                             return {
                                 'type': 'sell',
                                 'token_mint': token_mint,
                                 'sol_amount': sol_amount,
-                                'user': tx['transaction']['message']['accountKeys'][0],
-                                'signature': signature
+                                'user': tx['transaction']['message']['accountKeys'][0]
                             }
     except Exception as e:
         logger.debug(f"Error parsing Pump transaction {signature[:12]}: {e}")
-        return None
-
-def get_token_account(mint):
-    """Get token account for a mint address"""
-    try:
-        client = get_helius_client()
-        if not client:
-            return None
-            
-        token_accounts = client.get_token_accounts_by_owner(mint)
-        return token_accounts[0].pubkey if token_accounts else None
-    except Exception as e:
-        logger.debug(f"Error getting token account for {mint[:12]}: {e}")
         return None
 
 def get_token_transactions(mint, limit=20):
@@ -203,7 +182,19 @@ def get_token_transactions(mint, limit=20):
         logger.debug(f"Error getting token transactions for {mint[:12]}: {e}")
         return []
 
-# === PUMP.FUN API FUNCTIONS ===
+def get_token_account(mint):
+    """Get token account for a mint address"""
+    try:
+        client = get_helius_client()
+        if not client:
+            return None
+            
+        token_accounts = client.get_token_accounts_by_owner(mint)
+        return token_accounts[0].pubkey if token_accounts else None
+    except Exception as e:
+        logger.debug(f"Error getting token account for {mint[:12]}: {e}")
+        return None
+
 def get_token_market_cap(token_mint):
     """Get current market cap from Pump.fun API"""
     try:
@@ -275,7 +266,7 @@ def check_for_sells():
                         trade_data['user'] == wallet and
                         trade_data['token_mint'] == mint):
                         
-                        if close_trade_in_db(wallet, mint, trade_data['sol_amount'], buy_sol, trade_data['signature']):
+                        if close_trade_in_db(wallet, mint, trade_data['sol_amount'], buy_sol):
                             sells_found += 1
                             break
                             
@@ -292,7 +283,7 @@ def check_for_sells():
 # === MACHINE LEARNING ===
 try:
     from sklearn.model_selection import train_test_split
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.7.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
     import pandas as pd
     import joblib
@@ -306,7 +297,7 @@ def load_training_data():
         resp = supabase.table("wallets").select("tokens_traded, avg_hold_time_min, avg_pump_entry_mc, status").gte("tokens_traded", MIN_TRADES).execute()
         data = resp.data if resp.data else []
         if not data or len(data) < 10: 
-            logger.warning(f"AI Trainer: Insufficient data ({len(data)} wallets). Need at least 10.")
+            logger.warning(f"AI Trainer: Insufficient data ({len(data)} wallets. Need at least 10.")
             return None, None
         df = pd.DataFrame(data)
         X = df[['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc']]
@@ -366,7 +357,7 @@ def debug_status():
         logger.info(f"🤖 AI Model Status:")
         logger.info(f"  Model file exists: {model_exists}")
         logger.info(f"  Scaler file exists: {scaler_exists}")
-        logger.info(f"  Helius API: {'✅ Configured' if HELIUS_API_KEY else '❌ Not configured'}")
+        logger.info(f"  Helius API: {'✅ Configured' if HELIUS_API_KEY else '❌ Not configured'}
         
         # Check wallet data
         wallets_resp = supabase.table("wallets").select("status, elite_probability, tokens_traded").execute()
@@ -417,12 +408,12 @@ def score_wallets():
         logger.info("="*60)
         
         try:
-            # Check for sells
+            # Check for sells more frequently
             sells_found = check_for_sells()
             
             # Update wallet stats
             wallets_resp = supabase.table("wallets").select("address").execute()
-            wallets = [w["address"] for w in wallets_resp.data] if wallets_resp.data else []
+            wallets = [w["address"] for w in wallets_resp.data if wallets_resp.data else []
             
             # Train model if possible
             trained = train_model()
@@ -437,13 +428,13 @@ def score_wallets():
                 closed_trades = closed_resp.data if closed_resp.data else []
                 closed_rois = [t["roi"] for t in closed_trades]
                 wins = 0
-                avg_roi = 0
-                elite_probability = 0.0
+                avg_roi = sum(closed_rois) / len(closed_rois) if closed_rois else 0
+                win_rate = wins / len(closed_rois) if closed_rois else 0
                 
                 if len(closed_trades) >= MIN_TRADES:
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
-                    avg_roi = sum(closed_rois) / len(closed_rois)
-                    win_rate = wins / len(closed_rois)
+                    avg_roi = sum(closed_rois) / len(closed_rois) if closed_rois else 0
+                    win_rate = wins / len(closed_trades) if closed_trades else 0
                     
                     if ML_AVAILABLE:
                         hold_times_sec = []
@@ -479,7 +470,7 @@ def score_wallets():
             if elite:
                 logger.info(f"\n🌟� ELITE WALLETS: {len(elite)} found")
                 for w in elite[:5]:  # Show top 5
-                    logger.info(f"  - {w['address'][:12]}... | AI: {w.get('elite_probability', 0.0):.2%} | ROI: {w.get('total_roi', 0):.1f}x | Trades: {w.get('tokens_trades', 0)}")
+                    logger.info(f"  - {w['address'][:12]}... | AI: {w.get('elite_probability', 0.0):.2%} | ROI: {w.get('total_roi', 0):.1f}x | Trades: {w.get('tokens_traded', 0)}")
             else:
                 logger.info("\n⏳ No elite wallets yet. Keep collecting data...")
                 
@@ -526,29 +517,27 @@ async def main():
                             sol = data.get("solAmount")
                             mint = data.get("mint")
                             market_cap = data.get("marketCapSol", 0)
-                            signature = data.get("signature")
                             if wallet and sol and mint and sol >= MIN_BUY_SOL:
-                                save_buy(wallet, mint, sol, market_cap, signature)
+                                save_buy(wallet, mint, sol, market_cap)
                         
                         # Handle regular trade events (buys and sells)
                         elif data.get("txType") in ["buy", "sell"]:
                             wallet = data.get("traderPublicKey")
                             sol = data.get("solAmount")
                             mint = data.get("mint")
-                            signature = data.get("signature")
                             
                             if data.get("txType") == "buy" and wallet and sol and mint and sol >= MIN_BUY_SOL:
                                 # For regular buys, check if we already have an open trade
                                 open_trade = supabase.table("trades").select("id").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute()
                                 if not open_trade.data:  # Only save if no open trade exists
                                     market_cap = data.get("marketCapSol", 0)
-                                    save_buy(wallet, mint, sol, market_cap, signature)
+                                    save_buy(wallet, mint, sol, market_cap)
                             
                             elif data.get("txType") == "sell" and wallet and mint:
                                 # For sells, check if we have an open trade to close
                                 open_trade = supabase.table("trades").select("id, buy_sol").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute()
                                 if open_trade.data:
-                                    close_trade_in_db(wallet, mint, sol, open_trade.data[0]["buy_sol"], signature)
+                                    close_trade_in_db(wallet, mint, sol, open_trade.data[0]["buy_sol"])
                                 
                     except Exception as e:
                         logger.error(f"Message Error: {e}")
@@ -562,7 +551,7 @@ if __name__ == "__main__":
     logger.info("="*60)
     logger.info(f"⚙️ Config: MIN_BUY={MIN_BUY_SOL} SOL | MIN_TRADES={MIN_TRADES} | MIN_ROI={MIN_ROI}x")
     logger.info(f"🎯 Elite Threshold: {ELITE_THRESHOLD:.0%}")
-    logger.info(f"🤖 ML Available: {ML_AVAILABLE}")
+    logger.info(f"🤖� ML Available: {ML_AVAILABLE}")
     logger.info(f"📊 Scoring Interval: {CHECK_INTERVAL_SEC} seconds")
     logger.info(f"🔍 Sell Detection: Pump.fun API + Helius RPC")
     logger.info("="*60)
