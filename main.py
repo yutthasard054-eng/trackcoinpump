@@ -112,34 +112,46 @@ def get_token_market_cap(token_mint):
         return 0
 
 def get_token_trades_via_helius(token_mint):
-    """PRIMARY METHOD: Use Helius to fetch trades"""
+    """Fetch Pump.fun trades using Helius Parsed Transactions API"""
     if not HELIUS_API_KEY:
-        logger.warning("Helius API key not set - cannot fetch trades")
         return []
     
-    url = f"https://api.helius.xyz/v0/addresses/{token_mint}/transactions"
+    url = "https://api.helius.xyz/v0/transactions"
     try:
-        resp = requests.get(url, params={
-            "api-key": HELIUS_API_KEY,
-            "type": "TOKEN_PROGRAM_INSTRUCTION",
+        resp = requests.post(url, params={"api-key": HELIUS_API_KEY}, json={
+            "accounts": [token_mint],
+            "type": "SWAP",
             "limit": 100
         }, timeout=10)
         
         if resp.status_code != 200:
-            logger.debug(f"Helius returned {resp.status_code} for {token_mint[:12]}")
+            logger.debug(f"Helius Parsed TX returned {resp.status_code}")
             return []
         
         txs = resp.json()
         trades = []
-        
         for tx in txs:
             try:
-                wallet = tx["transaction"]["message"]["accountKeys"][0]
-                pre_bal = tx["meta"]["preBalances"][0]
-                post_bal = tx["meta"]["postBalances"][0]
-                sol_change = (pre_bal - post_bal) / 1e9
-                sol_amount = abs(sol_change)
-                tx_type = "buy" if sol_change > 0 else "sell"
+                # Helius parses swap details automatically
+                swap = tx.get("parsed", {}).get("swap")
+                if not swap:
+                    continue
+                
+                # Detect if this is a Pump.fun trade
+                if swap.get("programId") != "6EF8rrecthR5Dkzon8Nwu78hRvfCKub3dz7p6NRE5Z1Z":
+                    continue
+                
+                wallet = swap.get("trader")
+                input_token = swap.get("inputToken")
+                output_token = swap.get("outputToken")
+                
+                # Determine buy vs sell
+                if input_token == "So11111111111111111111111111111111111111112":  # SOL
+                    tx_type = "buy"
+                    sol_amount = float(swap.get("inputAmount", 0)) / 1e9
+                else:
+                    tx_type = "sell"
+                    sol_amount = float(swap.get("outputAmount", 0)) / 1e9
                 
                 trades.append({
                     "user": wallet,
@@ -147,13 +159,13 @@ def get_token_trades_via_helius(token_mint):
                     "sol_amount": sol_amount,
                     "timestamp": tx.get("blockTime", 0)
                 })
-            except (KeyError, TypeError, IndexError):
+            except Exception as e:
                 continue
         
         return trades
         
     except Exception as e:
-        logger.debug(f"Helius trade fetch error for {token_mint[:12]}: {e}")
+        logger.debug(f"Helius Parsed TX error for {token_mint[:12]}: {e}")
         return []
 
 # === SELL DETECTION ===
