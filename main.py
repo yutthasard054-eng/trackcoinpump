@@ -14,14 +14,12 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from datetime import datetime
 
-# === MACHINE LEARNING LIBRARIES ===
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import joblib 
 
-# === SUPABASE CONFIG (SECURE) ===
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pnvvnlcooykoqoebgfom.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
@@ -30,7 +28,6 @@ if not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# === CONFIG & ML SETUP ===
 MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "0.1"))
 MIN_TRADES = int(os.getenv("MIN_TRADES", "5"))
 MIN_ROI = float(os.getenv("MIN_ROI", "3.0"))
@@ -46,7 +43,6 @@ logger = logging.getLogger("PumpAI")
 
 executor = ThreadPoolExecutor(max_workers=5) 
 
-# Track stats
 stats = {
     "messages_received": 0,
     "buys_tracked": 0,
@@ -60,8 +56,6 @@ def cleanup_executor():
     executor.shutdown(wait=True)
     
 atexit.register(cleanup_executor)
-
-# === 1. LOGGING SETUP ===
 
 def setup_logging():
     log_queue = queue.Queue(-1)
@@ -78,8 +72,6 @@ def setup_logging():
     atexit.register(queue_listener.stop)
     logger.info("Non-blocking logging system initialized.")
 
-# === 2. MARKET CAP FETCHING ===
-
 def get_token_market_cap(token_mint):
     try:
         resp = requests.get(f"{TOKEN_DATA_URL}{token_mint}", timeout=5)
@@ -91,8 +83,6 @@ def get_token_market_cap(token_mint):
     except Exception as e:
         logger.warning(f"Failed to fetch market cap for {token_mint}: {e}")
         return 0
-
-# === 3. MACHINE LEARNING CORE ===
 
 def load_training_data():
     try:
@@ -194,8 +184,6 @@ def predict_wallet_score(wallet_features):
         logger.error(f"AI Predictor Error: {e}", exc_info=True)
         return 0.0
 
-# === 4. DATABASE FUNCTIONS ===
-
 def _save_buy_sync(wallet, token_mint, sol_amount, market_cap):
     ts = int(time.time())
     try:
@@ -285,8 +273,6 @@ def _get_open_trade_sync(wallet, token_mint):
     except Exception as e:
         logger.error(f"DB Error (get_open_trade): {e}", exc_info=True)
         return None
-
-# === 5. SCORING LOGIC ===
 
 async def score_wallets_async():
     await asyncio.get_event_loop().run_in_executor(executor, train_model) 
@@ -426,8 +412,6 @@ async def score_wallets_async():
             logger.error(f"Critical AI Scoring Error: {e}", exc_info=True)
             stats["errors"] += 1
 
-# === 6. WEBSOCKET LISTENER (ENHANCED WITH RAW LOGGING) ===
-
 open_trades_cache = {}
 
 async def ws_listener():
@@ -454,7 +438,6 @@ async def ws_listener():
                         stats["messages_received"] += 1
                         message_count += 1
                         
-                        # LOG FIRST 20 RAW MESSAGES
                         if stats["messages_received"] <= 20:
                             logger.info(f"RAW MESSAGE #{stats['messages_received']}: {message[:600]}")
                         
@@ -538,8 +521,6 @@ async def ws_listener():
             stats["errors"] += 1
             await asyncio.sleep(10)
 
-# === 7. MAIN ENTRY POINT ===
-
 if __name__ == "__main__":
     setup_logging()
     logger.info("="*60)
@@ -560,24 +541,3 @@ if __name__ == "__main__":
     finally:
         logger.info("Shutdown complete.")
         logger.info(f"Final Stats: Messages={stats['messages_received']} | Buys={stats['buys_tracked']} | Sells={stats['sells_detected']} | Errors={stats['errors']}")
-```
-
----
-
-## ✅ **What This Version Does:**
-
-1. **Logs first 20 raw messages** - You'll see EXACTLY what data is coming through
-2. **Shows message format** - We can debug the structure
-3. **Reports statistics** - Every 10 seconds shows message count
-4. **Enhanced error logging** - Catches and logs all issues
-5. **Lower threshold (0.1 SOL)** - More trades detected
-
----
-
-## 📊 **What You'll See:**
-
-Within 30 seconds:
-```
-RAW MESSAGE #1: {"method":"tokenTrade","data":{...}}
-RAW MESSAGE #2: {"signature":"abc123...","pool":"pump"...}
-RAW MESSAGE #3: ...
