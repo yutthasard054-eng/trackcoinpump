@@ -7,9 +7,21 @@ import threading
 from supabase import create_client
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
+
+# === MACHINE LEARNING LIBRARIES ===
+try:
+    from sklearn.model_selection import train_test_split
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    import pandas as pd
+    import joblib
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
 
 # === SUPABASE CONFIG ===
-SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"  # Fixed: no trailing spaces
+SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBudnZubGNvb3lrb3FvZWJnZm9tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTUwNTkyNywiZXhwIjoyMDc3MDgxOTI3fQ.rj4w2ohncSKrBmArNvxuhP-aTv-nKKqyE_An1WQrnwo"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -18,37 +30,28 @@ MIN_BUY_SOL = 0.5
 MIN_TRADES = 5
 MIN_ROI = 3.0
 CHECK_INTERVAL_SEC = 1800  # 30 minutes
+MODEL_FILE = 'elite_wallet_model.pkl'
+logger = logging.getLogger("PumpAI")
+executor = ThreadPoolExecutor(max_workers=5)
 
 # === LOGGING ===
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
-logger = logging.getLogger("PumpAI")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
 # === DATABASE FUNCTIONS ===
-
 def save_buy(wallet, token_mint, sol_amount):
     ts = int(time.time())
     try:
         supabase.table("trades").upsert({
-            "wallet": wallet,
-            "token_mint": token_mint,
-            "buy_sol": sol_amount,
-            "buy_ts": ts,
-            "status": "open"
+            "wallet": wallet, "token_mint": token_mint, "buy_sol": sol_amount,
+            "buy_ts": ts, "status": "open"
         }, on_conflict="wallet, token_mint, status").execute()
         supabase.table("wallets").upsert({
-            "address": wallet,
-            "first_seen": ts,
-            "last_updated": ts
+            "address": wallet, "first_seen": ts, "last_updated": ts
         }).execute()
         logger.info(f"🛒 Tracking Buy: {wallet} | {sol_amount} SOL | {token_mint}")
         return True
     except Exception as e:
-        if "23505" in str(e):
-            return True
+        if "23505" in str(e): return True
         logger.error(f"DB Error (save_buy): {e}")
         return False
 
@@ -56,10 +59,7 @@ def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol):
     roi = sell_sol / buy_sol if buy_sol > 0 else 0
     try:
         supabase.table("trades").update({
-            "sell_sol": sell_sol,
-            "sell_ts": int(time.time()),
-            "roi": roi,
-            "status": "closed"
+            "sell_sol": sell_sol, "sell_ts": int(time.time()), "roi": roi, "status": "closed"
         }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
         logger.info(f"💰 Closed: {wallet} | {token_mint} | ROI: {roi:.2f}x")
     except Exception as e:
@@ -73,36 +73,80 @@ def get_open_trades():
         logger.error(f"DB Error (get_open_trades): {e}")
         return []
 
-def update_wallet_status(wallet, tokens_traded, wins, total_roi, status):
+def update_wallet_status(wallet, tokens_traded, wins, total_roi, status, elite_probability=0.0):
     try:
-        supabase.table("wallets").update({
-            "tokens_traded": tokens_traded,
-            "wins": wins,
-            "total_roi": total_roi,
-            "status": status,
-            "last_updated": int(time.time())
-        }).eq("address", wallet).execute()
+        data = {
+            "tokens_traded": tokens_traded, "wins": wins, "total_roi": total_roi,
+            "status": status, "last_updated": int(time.time())
+        }
+        if ML_AVAILABLE:
+            data["elite_probability"] = elite_probability
+        supabase.table("wallets").update(data).eq("address", wallet).execute()
     except Exception as e:
         logger.error(f"DB Error (update_wallet_status): {e}")
 
-# === SCORING LOGIC (WITH SELL POLLING) ===
+# === MACHINE LEARNING FUNCTIONS ===
+def load_training_data():
+    if not ML_AVAILABLE: return None, None
+    try:
+        resp = supabase.table("wallets").select("tokens_traded, avg_hold_time_min, avg_pump_entry_mc, status").gte("tokens_traded", MIN_TRADES).execute()
+        data = resp.data if resp.data else []
+        if not data: return None, None
+        df = pd.DataFrame(data)
+        X = df[['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc']]
+        df['is_elite'] = df['status'].apply(lambda s: 1 if s == 'elite' else 0)
+        y = df['is_elite']
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        joblib.dump(scaler, 'scaler.pkl')
+        return X_scaled, y
+    except Exception as e:
+        logger.error(f"AI Trainer Error: {e}")
+        return None, None
 
+def train_model():
+    if not ML_AVAILABLE: return
+    X, y = load_training_data()
+    if X is None or len(X) == 0 or (len(y) > 0 and len(set(y)) < 2):
+        logger.warning("AI Trainer: Insufficient data for training.")
+        return
+    logger.info("🧠 AI Trainer: Starting model training...")
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = LogisticRegression(class_weight='balanced', solver='liblinear')
+    model.fit(X_train, y_train)
+    joblib.dump(model, MODEL_FILE)
+    logger.info(f"✅ AI Trainer: Model saved to {MODEL_FILE}")
+
+def predict_wallet_score(wallet_features):
+    if not ML_AVAILABLE: return 0.0
+    try:
+        model = joblib.load(MODEL_FILE)
+        scaler = joblib.load('scaler.pkl')
+        features_df = pd.DataFrame([wallet_features], columns=['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc'])
+        features_scaled = scaler.transform(features_df)
+        probability = model.predict_proba(features_scaled)[0][1]
+        return probability
+    except FileNotFoundError:
+        return 0.0
+    except Exception as e:
+        logger.error(f"AI Predictor Error: {e}")
+        return 0.0
+
+# === SCORING LOGIC ===
 def score_wallets():
     while True:
         time.sleep(CHECK_INTERVAL_SEC)
         logger.info("🔍 Checking for sells via Pump.fun API...")
         try:
-            # Check all open trades for sells
+            # Check for sells
             open_trades = get_open_trades()
             for trade in open_trades:
                 mint = trade["token_mint"]
                 wallet = trade["wallet"]
                 buy_sol = trade["buy_sol"]
-                
                 try:
                     resp = requests.get(f"https://frontend-api.pump.fun/trades/{mint}?limit=100", timeout=5)
-                    if resp.status_code != 200:
-                        continue
+                    if resp.status_code != 200: continue
                     trades = resp.json()
                     sells = [t for t in trades if t["type"] == "sell" and t["user"] == wallet]
                     if sells:
@@ -114,22 +158,48 @@ def score_wallets():
             wallets_resp = supabase.table("wallets").select("address").execute()
             wallets = [w["address"] for w in wallets_resp.data] if wallets_resp.data else []
             
+            if ML_AVAILABLE:
+                train_model()
+            
             for wallet in wallets:
                 closed_resp = supabase.table("trades").select("roi").eq("wallet", wallet).eq("status", "closed").execute()
                 closed_rois = [t["roi"] for t in closed_resp.data] if closed_resp.data else []
-                
                 wins = 0
                 avg_roi = 0
+                elite_probability = 0.0
+                
                 if len(closed_rois) >= MIN_TRADES:
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     avg_roi = sum(closed_rois) / len(closed_rois)
-                    status = "elite" if avg_roi >= MIN_ROI and wins / len(closed_rois) >= 0.6 else "demoted"
+                    win_rate = wins / len(closed_rois)
+                    
+                    if ML_AVAILABLE:
+                        # Calculate features for AI
+                        hold_times_sec = []
+                        entry_mcs = []
+                        closed_trades = supabase.table("trades").select("buy_ts, sell_ts, entry_market_cap").eq("wallet", wallet).eq("status", "closed").execute()
+                        for t in closed_trades.data or []:
+                            if t.get("sell_ts") and t.get("buy_ts"):
+                                hold_times_sec.append(t["sell_ts"] - t["buy_ts"])
+                            if t.get("entry_market_cap") is not None:
+                                entry_mcs.append(t["entry_market_cap"])
+                        avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 if hold_times_sec else 0.0
+                        avg_entry_mc = sum(entry_mcs) / len(entry_mcs) if entry_mcs else 0.0
+                        wallet_features = {
+                            "tokens_traded": len(closed_rois),
+                            "avg_hold_time_min": avg_hold_time,
+                            "avg_pump_entry_mc": avg_entry_mc
+                        }
+                        elite_probability = predict_wallet_score(wallet_features)
+                        status = "elite" if elite_probability >= 0.90 else "demoted"
+                    else:
+                        status = "elite" if win_rate >= 0.6 and avg_roi >= MIN_ROI else "demoted"
                 else:
                     status = "candidate"
                 
-                update_wallet_status(wallet, len(closed_rois), wins, avg_roi, status)
+                update_wallet_status(wallet, len(closed_rois), wins, avg_roi, status, elite_probability)
                 if status == "elite":
-                    logger.info(f"✅ ELITE: {wallet} | Wins: {wins} | Avg ROI: {avg_roi:.2f}x")
+                    logger.info(f"✅ ELITE: {wallet} | AI: {elite_probability:.4f}" if ML_AVAILABLE else f"✅ ELITE: {wallet}")
             
             # Log elite wallets
             elite_resp = supabase.table("wallets").select("address").eq("status", "elite").execute()
@@ -145,7 +215,6 @@ def score_wallets():
             logger.error(f"Scoring Error: {e}")
 
 # === WEBSOCKET LISTENER (CORRECT PARSING) ===
-
 async def main():
     threading.Thread(target=score_wallets, daemon=True).start()
     
@@ -162,8 +231,8 @@ async def main():
                 async for message in ws:
                     try:
                         data = json.loads(message)
-                        # Only 'create' events (buys) are sent
-                        if "txType" in data and data["txType"] == "create":
+                        # Only 'create' events are sent (buys)
+                        if data.get("txType") == "create":
                             wallet = data.get("traderPublicKey")
                             sol = data.get("solAmount")
                             mint = data.get("mint")
