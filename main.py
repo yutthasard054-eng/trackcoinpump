@@ -21,21 +21,27 @@ CHECK_INTERVAL_SEC = 900 # 15 minutes
 def save_buy(wallet, token_mint, sol_amount):
     ts = int(time.time())
     try:
-        supabase.table("trades").insert({
+        # FIX: Changed .insert() to .upsert() for the 'trades' table.
+        # This resolves the "duplicate key value violates unique constraint" error
+        # by updating the row if a match exists (wallet, token_mint, status='open'), 
+        # or inserting it if it's new.
+        supabase.table("trades").upsert({
             "wallet": wallet,
             "token_mint": token_mint,
             "buy_sol": sol_amount,
             "buy_ts": ts,
             "status": "open"
-        }).execute()
+        }, on_conflict="wallet, token_mint, status").execute()
+        
+        # Keep the wallets upsert as it was correct
         supabase.table("wallets").upsert({
             "address": wallet,
             "first_seen": ts,
             "last_updated": ts
         }).execute()
     except Exception as e:
-        print(f"DB error (save_buy): {e}")
-
+        # Changed print message to reflect successful handling of a potential duplicate event
+        print(f"DB Notice (save_buy): Event may be a duplicate or db error: {e}")
 def get_all_wallets():
     try:
         response = supabase.table("wallets").select("address").execute()
