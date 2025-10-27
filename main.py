@@ -40,12 +40,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 executor = ThreadPoolExecutor(max_workers=5)
 
 # === DATABASE FUNCTIONS ===
-def save_buy(wallet, token_mint, sol_amount):
+def save_buy(wallet, token_mint, sol_amount, market_cap=0):
     ts = int(time.time())
     try:
         supabase.table("trades").upsert({
             "wallet": wallet, "token_mint": token_mint, "buy_sol": sol_amount,
-            "buy_ts": ts, "status": "open"
+            "buy_ts": ts, "entry_market_cap": market_cap, "status": "open"
         }, on_conflict="wallet, token_mint, status").execute()
         supabase.table("wallets").upsert({
             "address": wallet, "first_seen": ts, "last_updated": ts
@@ -137,10 +137,12 @@ def predict_wallet_score(wallet_features):
 def score_wallets():
     while True:
         time.sleep(CHECK_INTERVAL_SEC)
-        logger.info("🔍 Checking for sells via Pump.fun API...")
+        logger.info("🔍 Starting AI scoring cycle...")
         try:
             # Check for sells
             open_trades = get_open_trades()
+            logger.info(f"Checking {len(open_trades)} open trades for sells...")
+            
             for trade in open_trades:
                 mint = trade["token_mint"]
                 wallet = trade["wallet"]
@@ -162,14 +164,18 @@ def score_wallets():
             if ML_AVAILABLE:
                 train_model()
             
+            logger.info(f"Scoring {len(wallets)} wallets...")
+            elite_count = 0
+            
             for wallet in wallets:
-                closed_resp = supabase.table("trades").select("roi").eq("wallet", wallet).eq("status", "closed").execute()
-                closed_rois = [t["roi"] for t in closed_resp.data] if closed_resp.data else []
+                closed_resp = supabase.table("trades").select("roi, buy_ts, sell_ts, entry_market_cap").eq("wallet", wallet).eq("status", "closed").execute()
+                closed_trades = closed_resp.data if closed_resp.data else []
+                closed_rois = [t["roi"] for t in closed_trades]
                 wins = 0
                 avg_roi = 0
                 elite_probability = 0.0
                 
-                if len(closed_rois) >= MIN_TRADES:
+                if len(closed_trades) >= MIN_TRADES:
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     avg_roi = sum(closed_rois) / len(closed_rois)
                     win_rate = wins / len(closed_rois)
@@ -177,8 +183,7 @@ def score_wallets():
                     if ML_AVAILABLE:
                         hold_times_sec = []
                         entry_mcs = []
-                        closed_trades = supabase.table("trades").select("buy_ts, sell_ts, entry_market_cap").eq("wallet", wallet).eq("status", "closed").execute()
-                        for t in closed_trades.data or []:
+                        for t in closed_trades:
                             if t.get("sell_ts") and t.get("buy_ts"):
                                 hold_times_sec.append(t["sell_ts"] - t["buy_ts"])
                             if t.get("entry_market_cap") is not None:
@@ -186,7 +191,7 @@ def score_wallets():
                         avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 if hold_times_sec else 0.0
                         avg_entry_mc = sum(entry_mcs) / len(entry_mcs) if entry_mcs else 0.0
                         wallet_features = {
-                            "tokens_traded": len(closed_rois),
+                            "tokens_traded": len(closed_trades),
                             "avg_hold_time_min": avg_hold_time,
                             "avg_pump_entry_mc": avg_entry_mc
                         }
@@ -197,24 +202,26 @@ def score_wallets():
                 else:
                     status = "candidate"
                 
-                update_wallet_status(wallet, len(closed_rois), wins, avg_roi, status, elite_probability)
+                update_wallet_status(wallet, len(closed_trades), wins, avg_roi, status, elite_probability)
                 if status == "elite":
+                    elite_count += 1
                     logger.info(f"✅ ELITE: {wallet} | AI: {elite_probability:.4f}" if ML_AVAILABLE else f"✅ ELITE: {wallet}")
             
             # Log elite wallets
-            elite_resp = supabase.table("wallets").select("address").eq("status", "elite").execute()
-            elite = [w["address"] for w in elite_resp.data] if elite_resp.data else []
+            elite_resp = supabase.table("wallets").select("address, elite_probability, total_roi, tokens_traded").eq("status", "elite").execute()
+            elite = elite_resp.data if elite_resp.data else []
+            
             if elite:
-                logger.info("🌟 ELITE WALLETS:")
-                for w in elite:
-                    logger.info(f"  - {w}")
+                logger.info(f"🌟 ELITE WALLETS: {len(elite)} found")
+                for w in elite[:5]:  # Show top 5
+                    logger.info(f"  - {w['address'][:12]}... | AI: {w.get('elite_probability', 0.0):.2%} | ROI: {w.get('total_roi', 0):.1f}x | Trades: {w.get('tokens_traded', 0)}")
             else:
-                logger.info("⏳ No elite wallets yet.")
+                logger.info("⏳ No elite wallets yet. Keep collecting data...")
                 
         except Exception as e:
             logger.error(f"Scoring Error: {e}")
 
-# === WEBSOCKET LISTENER (CORRECT PARSING) ===
+# === WEBSOCKET LISTENER ===
 async def main():
     threading.Thread(target=score_wallets, daemon=True).start()
     
@@ -231,13 +238,35 @@ async def main():
                 async for message in ws:
                     try:
                         data = json.loads(message)
-                        # Only 'create' events are sent (buys)
+                        
+                        # Handle token creation events (initial buys)
                         if data.get("txType") == "create":
                             wallet = data.get("traderPublicKey")
                             sol = data.get("solAmount")
                             mint = data.get("mint")
+                            market_cap = data.get("marketCapSol", 0)
                             if wallet and sol and mint and sol >= MIN_BUY_SOL:
-                                save_buy(wallet, mint, sol)
+                                save_buy(wallet, mint, sol, market_cap)
+                        
+                        # Handle regular trade events (buys and sells)
+                        elif data.get("txType") in ["buy", "sell"]:
+                            wallet = data.get("traderPublicKey")
+                            sol = data.get("solAmount")
+                            mint = data.get("mint")
+                            
+                            if data.get("txType") == "buy" and wallet and sol and mint and sol >= MIN_BUY_SOL:
+                                # For regular buys, check if we already have an open trade
+                                open_trade = supabase.table("trades").select("id").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute()
+                                if not open_trade.data:  # Only save if no open trade exists
+                                    market_cap = data.get("marketCapSol", 0)
+                                    save_buy(wallet, mint, sol, market_cap)
+                            
+                            elif data.get("txType") == "sell" and wallet and mint:
+                                # For sells, check if we have an open trade to close
+                                open_trade = supabase.table("trades").select("id, buy_sol").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute()
+                                if open_trade.data:
+                                    close_trade_in_db(wallet, mint, sol, open_trade.data[0]["buy_sol"])
+                                
                     except Exception as e:
                         logger.error(f"Message Error: {e}")
         except Exception as e:
