@@ -8,23 +8,23 @@ from supabase import create_client
 
 # === SUPABASE CONFIG ===
 SUPABASE_URL = "https://pnvvnlcooykoqoebgfom.supabase.co"
-# SERVICE_ROLE key to avoid permission issues and ensure client initialization
+# SERVICE_ROLE key is used for stability
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBudnZubGNvb3lrb3FvZWJnZm9tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTUwNTkyNywiZXhwIjoyMDc3MDgxOTI3fQ.rj4w2ohncSKrBmArNvxuhP-aTv-nKKqyE_An1WQrnwo"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# === CONFIGURATION ===
 MIN_BUY_SOL = 0.1
 MIN_TRADES = 3
 MIN_WIN_RATE = 0.6
 MIN_ROI = 2.0
-CHECK_INTERVAL_SEC = 900 # 15 minutes
+CHECK_INTERVAL_SEC = 900 # 15 minutes (Only for scoring, no more API polling!)
+
+# === DATABASE FUNCTIONS ===
 
 def save_buy(wallet, token_mint, sol_amount):
     ts = int(time.time())
     try:
-        # FIX: Changed .insert() to .upsert() for the 'trades' table.
-        # This resolves the "duplicate key value violates unique constraint" error
-        # by updating the row if a match exists (wallet, token_mint, status='open'), 
-        # or inserting it if it's new.
+        # Using upsert to prevent duplicate entry errors for the same open trade
         supabase.table("trades").upsert({
             "wallet": wallet,
             "token_mint": token_mint,
@@ -33,15 +33,17 @@ def save_buy(wallet, token_mint, sol_amount):
             "status": "open"
         }, on_conflict="wallet, token_mint, status").execute()
         
-        # Keep the wallets upsert as it was correct
+        # Upsert the wallet record
         supabase.table("wallets").upsert({
             "address": wallet,
             "first_seen": ts,
             "last_updated": ts
         }).execute()
+        return True
     except Exception as e:
-        # Changed print message to reflect successful handling of a potential duplicate event
-        print(f"DB Notice (save_buy): Event may be a duplicate or db error: {e}")
+        print(f"DB Error (save_buy): {e}")
+        return False
+
 def get_all_wallets():
     try:
         response = supabase.table("wallets").select("address").execute()
@@ -62,57 +64,48 @@ def update_wallet_status(wallet, tokens_traded, wins, total_roi, status):
     except Exception as e:
         print(f"DB error (update status): {e}")
 
-def get_trades_from_api(mint):
-    try:
-        # Increased timeout for robustness, as API can be slow
-        resp = requests.get(f"https://frontend-api.pump.fun/trades/{mint}?limit=100", timeout=10) 
-        return resp.json() if resp.status_code == 200 else []
-    except Exception as e:
-        # Added print for better debugging of API failures
-        print(f"API error (get_trades_from_api for {mint}): {e}")
-        return []
-
 def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol):
     roi = sell_sol / buy_sol if buy_sol > 0 else 0
     try:
+        # Find the specific 'open' trade to close
         supabase.table("trades").update({
             "sell_sol": sell_sol,
             "sell_ts": int(time.time()),
             "roi": roi,
             "status": "closed"
-        }).eq("wallet", wallet).eq("token_mint", token_mint).execute()
+        }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
+        
+        # NOTE: A subsequent run of score_wallets will pick this up and update wallet stats
     except Exception as e:
         print(f"DB error (close trade): {e}")
 
+def get_open_buy_sol(wallet, token_mint):
+    """Retrieves the original buy_sol amount for a currently open trade."""
+    try:
+        response = supabase.table("trades").select("buy_sol").eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").limit(1).execute()
+        if response.data:
+            return response.data[0]["buy_sol"]
+        return None
+    except Exception as e:
+        print(f"DB error (get_open_buy_sol): {e}")
+        return None
+
+# === SCORING LOGIC (NO MORE API POLLING) ===
+
 def score_wallets():
+    """Runs periodically to calculate and update wallet profitability scores."""
     while True:
         time.sleep(CHECK_INTERVAL_SEC)
         print("🧠 Scoring wallets for profitability...")
         try:
             wallets = get_all_wallets()
             for wallet in wallets:
-                # Get open trades for this wallet
-                open_trades = supabase.table("trades").select("token_mint, buy_sol").eq("wallet", wallet).eq("status", "open").execute()
-                if not open_trades.data:
-                    # Nothing to do if no open trades
-                    continue
-
-                # Iterate through open trades to check for sells (closing the trade)
-                for trade in open_trades.data: 
-                    mint = trade["token_mint"]
-                    buy_sol = trade["buy_sol"]
-                    api_trades = get_trades_from_api(mint)
-                    # Filter API trades for a sell from the tracked wallet
-                    sells = [t for t in api_trades if t["type"] == "sell" and t["user"] == wallet]
-                    if sells:
-                        # Close the trade using the last (most recent) sell amount
-                        close_trade_in_db(wallet, mint, sells[-1]["sol_amount"], buy_sol)
-
-                # Recalculate stats for closed trades
+                
+                # Recalculate stats based ONLY on closed trades
                 closed_resp = supabase.table("trades").select("roi").eq("wallet", wallet).eq("status", "closed").execute()
                 closed_rois = [t["roi"] for t in closed_resp.data] if closed_resp.data else []
 
-                # FIX: Initialize variables to prevent 'referenced before assignment' error
+                # Initialize variables to prevent 'referenced before assignment' error
                 wins = 0
                 avg_roi = 0
 
@@ -120,6 +113,7 @@ def score_wallets():
                     status = "candidate"
                 else:
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
+                    # Handle division by zero edge case for win_rate
                     win_rate = wins / len(closed_rois)
                     avg_roi = sum(closed_rois) / len(closed_rois)
                     
@@ -135,7 +129,7 @@ def score_wallets():
                 if status == "elite":
                     print(f"✅ ELITE: {wallet} | Wins: {wins} | Avg ROI: {avg_roi:.2f}x")
 
-            # Log elite list after all wallets have been scored
+            # Log elite list
             elite_resp = supabase.table("wallets").select("address").eq("status", "elite").execute()
             elite = [w["address"] for w in elite_resp.data] if elite_resp.data else []
             if elite:
@@ -148,6 +142,8 @@ def score_wallets():
         except Exception as e:
             print(f"⚠️ Scoring error: {e}")
 
+# === MAIN WEBSOCKET LISTENER (HANDLES BUYS AND SELLS) ===
+
 async def main():
     # Start the wallet scoring thread
     threading.Thread(target=score_wallets, daemon=True).start()
@@ -156,7 +152,7 @@ async def main():
     while True:
         try:
             async with websockets.connect(uri) as ws:
-                print("✅ Connected to PumpPortal WebSocket.")
+                print("✅ Connected to PumpPortal WebSocket. Subscribing to all trades...")
 
                 # Subscribe to ALL new tokens and trades
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
@@ -165,15 +161,33 @@ async def main():
                 async for message in ws:
                     try:
                         data = json.loads(message)
-                        # Filter for 'create' transactions (the initial buy)
-                        if data.get("txType") == "create":
-                            wallet = data["traderPublicKey"]
-                            sol = data["solAmount"]
-                            mint = data["mint"]
-                            # Only track buys above the minimum SOL amount
-                            if sol >= MIN_BUY_SOL:
-                                save_buy(wallet, mint, sol)
-                                print(f"🛒 Tracking: {wallet} | {sol} SOL | {mint}")
+                        tx_type = data.get("txType")
+                        
+                        # Data structure for create and trade events is slightly different
+                        wallet = data.get("traderPublicKey", data.get("user")) 
+                        sol = data.get("solAmount") 
+                        mint = data.get("mint")
+                        
+                        if tx_type == "create":
+                            # === HANDLE BUY (CREATE) ===
+                            if sol is not None and sol >= MIN_BUY_SOL:
+                                success = save_buy(wallet, mint, sol)
+                                if success:
+                                    print(f"🛒 Tracking Buy: {wallet} | {sol} SOL | {mint}")
+                                
+                        elif tx_type == "sell":
+                            # === HANDLE SELL (TRADE) ===
+                            if sol is not None and wallet and mint:
+                                # Need to retrieve the original buy_sol amount from the DB to calculate ROI
+                                buy_sol = get_open_buy_sol(wallet, mint)
+                                
+                                if buy_sol is not None:
+                                    close_trade_in_db(wallet, mint, sol, buy_sol)
+                                    print(f"💰 Trade Closed: {wallet} sold {mint} for {sol:.4f} SOL (ROI check next cycle)")
+                                else:
+                                    # Wallet sold, but we weren't tracking the initial buy
+                                    print(f"ℹ️ Sell Event: {wallet} sold {mint}, but no open buy trade was found.")
+
                     except Exception as e:
                         print(f"⚠️ Message processing error: {e}")
         except Exception as e:
@@ -182,7 +196,6 @@ async def main():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    # Ensure the entire application handles interruptions gracefully
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
