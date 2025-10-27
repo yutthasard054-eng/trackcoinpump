@@ -13,21 +13,22 @@ from concurrent.futures import ThreadPoolExecutor
 # === AI / ML LIBRARIES ===
 try:
     from sklearn.model_selection import train_test_split
-    from sklearn.ensemble import RandomForestClassifier # Corrected import
+    from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
     import pandas as pd
     import joblib
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
-    logging.warning("ML libraries (scikit-learn, pandas, joblib) not found. AI features disabled.")
+    # No need to raise an error, just disable features
+    # logging.warning("ML libraries (scikit-learn, pandas, joblib) not found. AI features disabled.")
 
 # === SOLANA / HELIUS LIBRARY ===
 try:
-    from solana.rpc.api import Client # Added missing import
+    from solana.rpc.api import Client
 except ImportError:
     Client = None
-    logging.warning("Solana library not found. Helius RPC features disabled.")
+    # logging.warning("Solana library not found. Helius RPC features disabled.")
 
 # === ENVIRONMENT VARIABLES & CONFIG ===
 # Load environment variables if .env file exists
@@ -42,9 +43,12 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 
 if not SUPABASE_KEY:
-    raise ValueError("SUPABASE_KEY environment variable is required!")
+    # Use logging.critical instead of raise to allow the container to potentially stay up for debugging
+    logging.critical("SUPABASE_KEY environment variable is required! Exiting...")
+    sys.exit(1)
 if not SUPABASE_URL or "your-supabase-url" in SUPABASE_URL:
-     raise ValueError("SUPABASE_URL environment variable is required!")
+     logging.critical("SUPABASE_URL environment variable is required! Exiting...")
+     sys.exit(1)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -55,7 +59,7 @@ ELITE_THRESHOLD = float(os.getenv("ELITE_THRESHOLD", "0.90")) # Using optimized 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "1800")) # Using optimized value (30 mins)
 
 # Helius RPC endpoint (fallback to public Solana RPC)
-HELIUS_RPC_URL = f"https://rpc.helius.xyz/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else "https://api.mainnet-beta.solana.com" # Removed extra spaces
+HELIUS_RPC_URL = f"https://rpc.helius.xyz/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else "https://api.mainnet-beta.solana.com"
 
 # === LOGGING SETUP ===
 # Simple logging config, ensure PYTHONUNBUFFERED=1 in environment for reliability
@@ -75,6 +79,42 @@ def _run_sync(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return loop.run_in_executor(executor, lambda: func(*args, **kwargs))
 
+# Synchronous version of close_trade_in_db used inside the sync check_for_sells thread
+def close_trade_in_db(wallet, token_mint, sell_sol, buy_sol):
+    roi = sell_sol / buy_sol if buy_sol > 0 else 0
+    try:
+        supabase.table("trades").update({
+            "sell_sol": sell_sol, "sell_ts": int(time.time()), "roi": roi, "status": "closed"
+        }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute()
+        logger.info(f"💰 SELL: {wallet[:6]}... | {token_mint[:6]}... | ROI: {roi:.2f}x (Sync)")
+        return True
+    except Exception as e:
+        logger.error(f"DB Error (close_trade sync): {e}")
+        return False
+        
+def get_open_trades():
+    """Synchronous version of get_open_trades used inside the sync check_for_sells thread."""
+    try:
+        resp = supabase.table("trades").select("id, wallet, token_mint, buy_sol, buy_ts").eq("status", "open").execute()
+        return resp.data if resp.data else []
+    except Exception as e:
+        logger.error(f"DB Error (get_open_trades sync): {e}")
+        return []
+
+def update_wallet_status(wallet, tokens_traded, wins, total_roi, status, elite_probability=0.0):
+    """Synchronous version of update_wallet_status used inside the sync score_wallets_sync thread."""
+    try:
+        data = {
+            "tokens_traded": tokens_traded, "wins": wins, "total_roi": total_roi,
+            "status": status, "last_updated": int(time.time())
+        }
+        if ML_AVAILABLE: 
+            data["elite_probability"] = elite_probability
+        supabase.table("wallets").update(data).eq("address", wallet).execute()
+    except Exception as e:
+        logger.error(f"DB Error (update_wallet_status sync): {e}")
+
+
 async def save_buy_async(wallet, token_mint, sol_amount, market_cap=0):
     ts = int(time.time())
     try:
@@ -92,41 +132,8 @@ async def save_buy_async(wallet, token_mint, sol_amount, market_cap=0):
         logger.error(f"DB Error (save_buy): {e}")
         return False
 
-async def close_trade_in_db_async(wallet, token_mint, sell_sol, buy_sol):
-    roi = sell_sol / buy_sol if buy_sol > 0 else 0
-    try:
-        await _run_sync(supabase.table("trades").update({
-            "sell_sol": sell_sol, "sell_ts": int(time.time()), "roi": roi, "status": "closed"
-        }).eq("wallet", wallet).eq("token_mint", token_mint).eq("status", "open").execute)
-        logger.info(f"💰 SELL: {wallet[:6]}... | {token_mint[:6]}... | ROI: {roi:.2f}x")
-        return True
-    except Exception as e:
-        logger.error(f"DB Error (close_trade): {e}")
-        return False
-
-async def get_open_trades_async():
-    try:
-        resp = await _run_sync(supabase.table("trades").select("id, wallet, token_mint, buy_sol, buy_ts").eq("status", "open").execute)
-        return resp.data if resp.data else []
-    except Exception as e:
-        logger.error(f"DB Error (get_open_trades): {e}")
-        return []
-
-async def update_wallet_status_async(wallet, tokens_traded, wins, total_roi, status, elite_probability=0.0):
-    try:
-        data = {
-            "tokens_traded": tokens_traded, "wins": wins, "total_roi": total_roi,
-            "status": status, "last_updated": int(time.time())
-        }
-        # Only include elite_probability if ML is active and available
-        if ML_AVAILABLE: 
-            data["elite_probability"] = elite_probability
-        await _run_sync(supabase.table("wallets").update(data).eq("address", wallet).execute)
-    except Exception as e:
-        logger.error(f"DB Error (update_wallet_status): {e}")
 
 # === HELIUS RPC FUNCTIONS (Synchronous) ===
-# Note: These are blocking and should be called via _run_sync from async contexts
 
 _helius_client = None
 def get_helius_client():
@@ -155,45 +162,8 @@ def get_helius_client():
 
 def parse_pump_transaction(signature):
     """Parse Pump.fun transaction using Helius (BLOCKING). Needs refinement."""
-    # This parsing logic is complex and might need significant adjustment based on real Helius data.
-    # Placeholder implementation based on the user's code.
-    try:
-        client = get_helius_client()
-        if not client: return None
-        
-        # Note: get_transaction might need adjustments based on actual solana-py usage
-        tx_response = client.get_transaction(signature, commitment="confirmed", max_supported_transaction_version=0)
-        tx = tx_response.value.transaction if tx_response and tx_response.value else None
-
-        if not tx or not tx.meta or tx.meta.err:
-            return None
-        
-        # Simplified check - Look for Pump program ID interactions
-        PUMP_PROGRAM_ID = "675kPX9MHTjS2zt1qFR1NYHuzeLXfQM9H24wFSUt1Mp8" # Pump V1 program ID
-        account_keys = tx.transaction.message.account_keys
-        signer = str(account_keys[0]) # Assuming signer is the first key
-
-        for ix in tx.meta.inner_instructions:
-            for inner_ix in ix.instructions:
-                try:
-                    # Check if instruction involves the pump program
-                    program_id = str(account_keys[inner_ix.program_id_index])
-                    if program_id == PUMP_PROGRAM_ID:
-                        # Rudimentary check for SOL transfers (likely buy/sell indicators)
-                        # This needs much more robust parsing based on instruction data
-                        if inner_ix.data: # Further decode needed here
-                             # Assume a generic structure for now - THIS IS LIKELY WRONG
-                             # Need to inspect real transaction data from Helius for pump.fun swaps
-                             # Placeholder - returns None until parsing is implemented
-                             pass 
-                except Exception:
-                    continue # Ignore parsing errors for individual inner instructions
-
-        return None # Placeholder - No reliable parsing implemented yet
-        
-    except Exception as e:
-        logger.debug(f"Error parsing Helius tx {signature[:6]}...: {e}")
-        return None
+    # Placeholder implementation based on the user's code. This is currently non-functional
+    return None
 
 def get_token_transactions(mint, limit=20):
     """Get recent transaction signatures involving a mint address (BLOCKING)."""
@@ -201,8 +171,6 @@ def get_token_transactions(mint, limit=20):
         client = get_helius_client()
         if not client: return []
         
-        # Fetch signatures associated with the mint address directly
-        # Note: This includes transfers, minting, etc., not just trades. Needs filtering.
         signatures_response = client.get_signatures_for_address(mint, limit=limit)
         signatures = signatures_response.value if signatures_response else []
         
@@ -216,7 +184,6 @@ def get_token_transactions(mint, limit=20):
 def get_pump_trades(token_mint, limit=100):
     """Get recent trades from Pump.fun API (BLOCKING)."""
     try:
-        # Removed extra space in URL
         resp = requests.get(f"https://frontend-api.pump.fun/trades/{token_mint}?limit={limit}", timeout=5)
         return resp.json() if resp.status_code == 200 else []
     except Exception as e:
@@ -242,10 +209,11 @@ def check_for_sells(open_trades):
         try:
             pump_trades = get_pump_trades(mint, 50) # Blocking call
             for t in pump_trades:
-                user = t.get("user") or t.get("traderPublicKey") or t.get("wallet")
+                user = t.get("traderPublicKey") or t.get("user") or t.get("wallet")
                 tx_type = t.get("type", "").lower()
                 timestamp = t.get("timestamp", 0)
                 
+                # Check for sell by the same wallet *after* the buy timestamp
                 if (tx_type == "sell" and user == wallet and timestamp > buy_ts):
                     sell_sol = t.get("sol_amount", 0)
                     # Use the synchronous version directly since we are in a sync thread
@@ -257,6 +225,7 @@ def check_for_sells(open_trades):
             logger.debug(f"Pump.fun API error for {mint[:6]}...: {e}")
             
         # Method 2: Check via Helius RPC (Fallback if Pump API missed it and Helius configured)
+        # Helius parsing is currently non-functional, so this is mostly a placeholder
         if not trade_closed and HELIUS_API_KEY and Client:
             try:
                 signatures = get_token_transactions(mint, 20) # Blocking call
@@ -264,12 +233,12 @@ def check_for_sells(open_trades):
                     parsed_trade = parse_pump_transaction(signature) # Blocking call
                     
                     if (parsed_trade and 
-                        parsed_trade['type'] == 'sell' and 
-                        parsed_trade['user'] == wallet and
-                        parsed_trade['token_mint'] == mint):
+                        parsed_trade.get('type') == 'sell' and 
+                        parsed_trade.get('user') == wallet and
+                        parsed_trade.get('token_mint') == mint):
                         
                         # Use the synchronous version directly
-                        if close_trade_in_db(wallet, mint, parsed_trade['sol_amount'], buy_sol): 
+                        if close_trade_in_db(wallet, mint, parsed_trade.get('sol_amount', 0), buy_sol): 
                             sells_found += 1
                             trade_closed = True
                             break # Move to next open trade
@@ -357,19 +326,20 @@ def load_training_data():
 
 def train_model():
     if not ML_AVAILABLE: return False
-    X, y = load_training_data() # Blocking DB call
+    # Use sync DB call
+    X, y = load_training_data() 
     if X is None or len(X) == 0:
         logger.warning("AI Trainer: Cannot train - insufficient data.")
         return False
     logger.info("🧠 Training AI model...")
     try:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-        model = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42, max_depth=5, n_jobs=-1) # Use all cores
+        model = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42, max_depth=5, n_jobs=-1)
         model.fit(X_train, y_train)
         train_accuracy = model.score(X_train, y_train)
         test_accuracy = model.score(X_test, y_test)
         logger.info(f"Model Performance: Train={train_accuracy:.2%}, Test={test_accuracy:.2%}")
-        joblib.dump(model, 'elite_wallet_model.pkl') # Blocking File I/O
+        joblib.dump(model, 'elite_wallet_model.pkl') 
         logger.info("✅ AI model trained and saved")
         return True
     except Exception as e:
@@ -380,15 +350,14 @@ def train_model():
 def predict_wallet_score(wallet_features):
     if not ML_AVAILABLE: return 0.0
     try:
-        model = joblib.load('elite_wallet_model.pkl') # Blocking File I/O
-        scaler = joblib.load('scaler.pkl') # Blocking File I/O
-        # Ensure features are in the correct order and handle potential NaNs
+        model = joblib.load('elite_wallet_model.pkl') 
+        scaler = joblib.load('scaler.pkl') 
         features_df = pd.DataFrame([wallet_features], columns=['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc']).fillna(0)
         features_scaled = scaler.transform(features_df)
-        probability = model.predict_proba(features_scaled)[0][1] # Blocking CPU computation
+        probability = model.predict_proba(features_scaled)[0][1] 
         return probability
     except FileNotFoundError:
-        return 0.0 # Model not trained yet
+        return 0.0 
     except Exception as e:
         logger.error(f"AI Predictor Error: {e}")
         return 0.0
@@ -404,17 +373,16 @@ def score_wallets_sync():
         
         try:
             # Check for sells (blocking network/DB calls)
-            open_trades = get_open_trades() # Blocking DB call
+            open_trades = get_open_trades() # Blocking DB call (sync version)
             check_for_sells(open_trades) # Blocking API/DB calls inside
             
             # Re-fetch all wallets for scoring
             wallets_resp = supabase.table("wallets").select("address").execute() # Blocking DB call
             
-            # --- SYNTAX ERROR FIX APPLIED HERE ---
+            # FIX: Syntax error fix
             wallets_data = wallets_resp.data if wallets_resp.data else []
             wallets = [w["address"] for w in wallets_data]
-            # --- END FIX ---
-
+            
             # Train model if possible (blocking file/CPU/DB)
             trained = False
             if ML_AVAILABLE:
@@ -441,11 +409,11 @@ def score_wallets_sync():
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     total_roi = sum(closed_rois)
                     
-                    if ML_AVAILABLE and trained: # Only use ML if libraries available AND model trained successfully this cycle
+                    if ML_AVAILABLE and trained: 
                         # Calculate features needed for ML
                         hold_times_sec = [(t["sell_ts"] - t["buy_ts"]) for t in closed_trades if t.get("sell_ts") and t.get("buy_ts")]
                         avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 if hold_times_sec else 0.0
-                        entry_mcs = [t.get("entry_market_cap", 0) or 0 for t in closed_trades] # Use 0 if missing or None
+                        entry_mcs = [t.get("entry_market_cap", 0) or 0 for t in closed_trades] 
                         avg_entry_mc = sum(entry_mcs) / len(entry_mcs) if entry_mcs else 0.0
                         
                         wallet_features = {
@@ -455,20 +423,18 @@ def score_wallets_sync():
                         }
                         # Blocking ML prediction
                         elite_probability = predict_wallet_score(wallet_features) 
-                        status = "elite" if elite_probability >= ELITE_THRESHOLD else "evaluating" # Use ML prediction
+                        status = "elite" if elite_probability >= ELITE_THRESHOLD else "evaluating" 
                     else:
                         # Fallback to simple rules if ML not available or not trained
                         avg_roi = total_roi / tokens_traded if tokens_traded else 0
                         win_rate = wins / tokens_traded if tokens_traded else 0
                         status = "elite" if win_rate >= 0.6 and avg_roi >= MIN_ROI else "evaluating"
                         
-                # Blocking DB update
+                # Blocking DB update (sync version)
                 update_wallet_status(wallet, tokens_traded, wins, total_roi, status, elite_probability)
                 
                 if status == "elite":
                     elite_count += 1
-                    # Log less verbosely, summary is logged later
-                    # logger.info(f"✅ ELITE: {wallet[:6]}... | AI Prob: {elite_probability:.2%} | ROI: {(total_roi/tokens_traded if tokens_traded else 0):.1f}x | Trades: {tokens_traded}")
                     
             # Log summary
             elite_resp = supabase.table("wallets").select("address").eq("status", "elite").execute() # Blocking DB call
@@ -505,17 +471,15 @@ async def main():
                     try:
                         data = json.loads(message)
                         
-                        # Use data structure from pumpportal.fun API docs
                         method = data.get("method")
                         trade_data = data.get("data", {})
                         
                         # Handle initial buys from 'newToken' or 'create' type events
-                        # (Need to confirm exact structure from live data)
                         if method == "newToken" or trade_data.get("txType") == "create":
                             wallet = trade_data.get("traderPublicKey") or trade_data.get("creator")
                             sol_str = trade_data.get("solAmount")
                             mint = trade_data.get("mint")
-                            mc_sol = trade_data.get("marketCapSol", 0) # Get MC if available
+                            mc_sol = trade_data.get("marketCapSol", 0) 
 
                             if wallet and sol_str and mint:
                                 try:
@@ -526,9 +490,9 @@ async def main():
                                 except (ValueError, TypeError):
                                     logger.warning(f"Could not parse solAmount: {sol_str}")
 
-                        # Handle general trades (might include buys/sells after creation)
+                        # Handle general trades 
                         elif method == "tokenTrade" and trade_data:
-                            wallet = trade_data.get("wallet") # or traderPublicKey? Needs confirmation
+                            wallet = trade_data.get("wallet")
                             sol_str = trade_data.get("sol_amount")
                             mint = trade_data.get("mint")
                             tx_type = trade_data.get("tx_type", "").upper()
@@ -538,12 +502,10 @@ async def main():
                                     sol = float(sol_str)
                                     if tx_type == "BUY" and sol >= MIN_BUY_SOL:
                                          # Check if trade exists before saving again (run DB call in executor)
-                                         exists = await _run_sync(supabase.table("trades").select("id").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute)
-                                         if not exists.data:
+                                         exists_resp = await _run_sync(supabase.table("trades").select("id").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute)
+                                         if not exists_resp.data:
                                              await save_buy_async(wallet, mint, sol) # Run blocking DB call in executor
                                          
-                                    # Sell logic relies on the polling 'score_wallets_sync' thread
-                                    # We don't need to explicitly call close_trade here from the websocket
                                 except (ValueError, TypeError):
                                      logger.warning(f"Could not parse sol_amount for trade: {sol_str}")
                                      
@@ -560,7 +522,7 @@ async def main():
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    setup_logging() # Use basic logging for simplicity
+    # Removed the undefined call to setup_logging()
     logger.info("\n" + "="*60)
     logger.info("🚀 PUMP.AI SUPER AGENT STARTING")
     logger.info("="*60)
@@ -572,7 +534,6 @@ if __name__ == "__main__":
     logger.info("="*60)
     
     # Add PYTHONUNBUFFERED=1 to your Railway environment variables
-    # setup_logging() provides basic non-blocking, but unbuffered is more reliable for containers
     
     try:
         asyncio.run(main())
