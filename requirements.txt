@@ -1,5 +1,6 @@
 websockets==13.1
 requests==2.32.3
 supabase==2.7.0
-pandas
-scikit-learn
+scikit-learn==1.4.2
+pandas==2.2.2
+joblib==1.4.2
