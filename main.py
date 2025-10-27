@@ -248,7 +248,8 @@ def check_for_sells(open_trades):
                 
                 if (tx_type == "sell" and user == wallet and timestamp > buy_ts):
                     sell_sol = t.get("sol_amount", 0)
-                    if close_trade_in_db(wallet, mint, sell_sol, buy_sol): # Blocking call
+                    # Use the synchronous version directly since we are in a sync thread
+                    if close_trade_in_db(wallet, mint, sell_sol, buy_sol): 
                         sells_found += 1
                         trade_closed = True
                         break # Move to next open trade
@@ -267,7 +268,8 @@ def check_for_sells(open_trades):
                         parsed_trade['user'] == wallet and
                         parsed_trade['token_mint'] == mint):
                         
-                        if close_trade_in_db(wallet, mint, parsed_trade['sol_amount'], buy_sol): # Blocking call
+                        # Use the synchronous version directly
+                        if close_trade_in_db(wallet, mint, parsed_trade['sol_amount'], buy_sol): 
                             sells_found += 1
                             trade_closed = True
                             break # Move to next open trade
@@ -329,11 +331,73 @@ def periodic_debug():
         time.sleep(600) 
         debug_status()
 
+# === MACHINE LEARNING FUNCTIONS (Synchronous - Called within scoring thread) ===
+def load_training_data():
+    if not ML_AVAILABLE: return None, None
+    try:
+        resp = supabase.table("wallets").select("tokens_traded, avg_hold_time_min, avg_pump_entry_mc, status").gte("tokens_traded", MIN_TRADES).execute()
+        data = resp.data if resp.data else []
+        if not data or len(data) < 10: 
+            logger.warning(f"AI Trainer: Insufficient data ({len(data)} wallets. Need at least 10.")
+            return None, None
+        df = pd.DataFrame(data)
+        X = df[['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc']].fillna(0) # Fill NaN with 0
+        df['is_elite'] = df['status'].apply(lambda s: 1 if s == 'elite' else 0)
+        y = df['is_elite']
+        if len(y.unique()) < 2:
+            logger.warning("AI Trainer: Only one class present in training data.")
+            return None, None
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        joblib.dump(scaler, 'scaler.pkl')
+        return X_scaled, y
+    except Exception as e:
+        logger.error(f"AI Trainer Error (load_data): {e}")
+        return None, None
+
+def train_model():
+    if not ML_AVAILABLE: return False
+    X, y = load_training_data() # Blocking DB call
+    if X is None or len(X) == 0:
+        logger.warning("AI Trainer: Cannot train - insufficient data.")
+        return False
+    logger.info("🧠 Training AI model...")
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        model = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42, max_depth=5, n_jobs=-1) # Use all cores
+        model.fit(X_train, y_train)
+        train_accuracy = model.score(X_train, y_train)
+        test_accuracy = model.score(X_test, y_test)
+        logger.info(f"Model Performance: Train={train_accuracy:.2%}, Test={test_accuracy:.2%}")
+        joblib.dump(model, 'elite_wallet_model.pkl') # Blocking File I/O
+        logger.info("✅ AI model trained and saved")
+        return True
+    except Exception as e:
+        logger.error(f"AI Model Training Failed: {e}", exc_info=True)
+        return False
+
+
+def predict_wallet_score(wallet_features):
+    if not ML_AVAILABLE: return 0.0
+    try:
+        model = joblib.load('elite_wallet_model.pkl') # Blocking File I/O
+        scaler = joblib.load('scaler.pkl') # Blocking File I/O
+        # Ensure features are in the correct order and handle potential NaNs
+        features_df = pd.DataFrame([wallet_features], columns=['tokens_traded', 'avg_hold_time_min', 'avg_pump_entry_mc']).fillna(0)
+        features_scaled = scaler.transform(features_df)
+        probability = model.predict_proba(features_scaled)[0][1] # Blocking CPU computation
+        return probability
+    except FileNotFoundError:
+        return 0.0 # Model not trained yet
+    except Exception as e:
+        logger.error(f"AI Predictor Error: {e}")
+        return 0.0
+
 # === SCORING LOGIC (Synchronous - Runs in its own thread) ===
 def score_wallets_sync():
     """Main scoring loop - runs blocking operations."""
     while True:
-        time.sleep(CHECK_INTERVAL_SEC)
+        time.sleep(CHECK_INTERVAL_SEC) # Blocking sleep
         logger.info("\n" + "="*60)
         logger.info("🧠 Starting AI scoring cycle...")
         logger.info("="*60)
@@ -345,9 +409,13 @@ def score_wallets_sync():
             
             # Re-fetch all wallets for scoring
             wallets_resp = supabase.table("wallets").select("address").execute() # Blocking DB call
-            wallets = [w["address"] for w in wallets_resp.data if wallets_resp.data else []
             
-            # Train model if ML available (blocking file/CPU/DB)
+            # --- SYNTAX ERROR FIX APPLIED HERE ---
+            wallets_data = wallets_resp.data if wallets_resp.data else []
+            wallets = [w["address"] for w in wallets_data]
+            # --- END FIX ---
+
+            # Train model if possible (blocking file/CPU/DB)
             trained = False
             if ML_AVAILABLE:
                 trained = train_model() # Blocking call
@@ -358,7 +426,8 @@ def score_wallets_sync():
             elite_count = 0
             
             for wallet in wallets:
-                closed_resp = supabase.table("trades").select("roi, buy_ts, sell_ts, entry_market_cap").eq("wallet", wallet).eq("status", "closed").execute() # Blocking DB call
+                # Blocking DB call
+                closed_resp = supabase.table("trades").select("roi, buy_ts, sell_ts, entry_market_cap").eq("wallet", wallet).eq("status", "closed").execute() 
                 closed_trades = closed_resp.data if closed_resp.data else []
                 tokens_traded = len(closed_trades)
                 
@@ -368,7 +437,7 @@ def score_wallets_sync():
                 elite_probability = 0.0 # Default probability
                 
                 if tokens_traded >= MIN_TRADES:
-                    closed_rois = [t["roi"] for t in closed_trades]
+                    closed_rois = [t.get("roi", 0) or 0 for t in closed_trades] # Handle None ROI
                     wins = len([r for r in closed_rois if r >= MIN_ROI])
                     total_roi = sum(closed_rois)
                     
@@ -376,7 +445,7 @@ def score_wallets_sync():
                         # Calculate features needed for ML
                         hold_times_sec = [(t["sell_ts"] - t["buy_ts"]) for t in closed_trades if t.get("sell_ts") and t.get("buy_ts")]
                         avg_hold_time = (sum(hold_times_sec) / len(hold_times_sec)) / 60 if hold_times_sec else 0.0
-                        entry_mcs = [t.get("entry_market_cap", 0) for t in closed_trades] # Use 0 if missing
+                        entry_mcs = [t.get("entry_market_cap", 0) or 0 for t in closed_trades] # Use 0 if missing or None
                         avg_entry_mc = sum(entry_mcs) / len(entry_mcs) if entry_mcs else 0.0
                         
                         wallet_features = {
@@ -398,7 +467,8 @@ def score_wallets_sync():
                 
                 if status == "elite":
                     elite_count += 1
-                    logger.info(f"✅ ELITE: {wallet[:6]}... | AI Prob: {elite_probability:.2%} | ROI: {(total_roi/tokens_traded if tokens_traded else 0):.1f}x | Trades: {tokens_traded}")
+                    # Log less verbosely, summary is logged later
+                    # logger.info(f"✅ ELITE: {wallet[:6]}... | AI Prob: {elite_probability:.2%} | ROI: {(total_roi/tokens_traded if tokens_traded else 0):.1f}x | Trades: {tokens_traded}")
                     
             # Log summary
             elite_resp = supabase.table("wallets").select("address").eq("status", "elite").execute() # Blocking DB call
@@ -417,7 +487,7 @@ async def main():
     threading.Thread(target=score_wallets_sync, daemon=True, name="ScoringThread").start()
     threading.Thread(target=periodic_debug, daemon=True, name="DebugThread").start()
     
-    # Initial status check
+    # Initial status check (run blocking function in executor)
     await _run_sync(debug_status) 
     
     uri = "wss://pumpportal.fun/api/data"
@@ -451,7 +521,8 @@ async def main():
                                 try:
                                     sol = float(sol_str)
                                     if sol >= MIN_BUY_SOL:
-                                        await save_buy_async(wallet, mint, sol, mc_sol)
+                                        # Run blocking DB call in executor
+                                        await save_buy_async(wallet, mint, sol, mc_sol) 
                                 except (ValueError, TypeError):
                                     logger.warning(f"Could not parse solAmount: {sol_str}")
 
@@ -466,10 +537,10 @@ async def main():
                                 try:
                                     sol = float(sol_str)
                                     if tx_type == "BUY" and sol >= MIN_BUY_SOL:
-                                         # Check if trade exists before saving again
+                                         # Check if trade exists before saving again (run DB call in executor)
                                          exists = await _run_sync(supabase.table("trades").select("id").eq("wallet", wallet).eq("token_mint", mint).eq("status", "open").execute)
                                          if not exists.data:
-                                             await save_buy_async(wallet, mint, sol)
+                                             await save_buy_async(wallet, mint, sol) # Run blocking DB call in executor
                                          
                                     # Sell logic relies on the polling 'score_wallets_sync' thread
                                     # We don't need to explicitly call close_trade here from the websocket
@@ -499,6 +570,9 @@ if __name__ == "__main__":
     logger.info(f"🕒 Scoring Interval: {CHECK_INTERVAL_SEC} seconds")
     logger.info(f"🔍 Sell Detection: Pump.fun API + Helius RPC (Fallback: {HELIUS_API_KEY is not None and Client is not None})")
     logger.info("="*60)
+    
+    # Add PYTHONUNBUFFERED=1 to your Railway environment variables
+    # setup_logging() provides basic non-blocking, but unbuffered is more reliable for containers
     
     try:
         asyncio.run(main())
