@@ -5,3 +5,7 @@ solana
 scikit-learn==1.4.2
 pandas==2.2.2
 joblib==1.4.2
+flask
+python-dotenv
+supabase
+numpy==1.26.4
